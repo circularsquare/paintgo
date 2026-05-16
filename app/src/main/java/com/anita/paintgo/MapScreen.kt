@@ -9,10 +9,10 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.location.Location
 import android.net.Uri
+import android.os.Build
 import android.os.Looper
 import android.provider.Settings
 import android.util.Log
-import android.view.MotionEvent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
@@ -22,7 +22,9 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.LocationOn
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.Button
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
@@ -31,6 +33,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -61,13 +64,16 @@ import org.maplibre.android.maps.MapLibreMap
 import org.maplibre.android.maps.MapView
 import org.maplibre.android.maps.Style
 import org.maplibre.android.style.layers.CircleLayer
+import org.maplibre.android.style.layers.FillExtrusionLayer
+import org.maplibre.android.style.layers.Property
 import org.maplibre.android.style.layers.PropertyFactory
 import org.maplibre.android.style.sources.GeoJsonSource
 import org.maplibre.geojson.Feature
 import org.maplibre.geojson.Point
 import kotlin.coroutines.resume
 
-private const val DEMO_STYLE_URL = "https://demotiles.maplibre.org/style.json"
+// OpenFreeMap — free, no API key. Alternatives: liberty, bright, dark.
+private const val MAP_STYLE_URL = "https://tiles.openfreemap.org/styles/positron"
 private val DEFAULT_CENTER = LatLng(40.7128, -74.0060) // NYC
 private const val DEFAULT_ZOOM = 11.0
 private const val USER_ZOOM = 15.0
@@ -92,6 +98,7 @@ fun MapScreen(modifier: Modifier = Modifier) {
     var userLocation by remember { mutableStateOf<LatLng?>(null) }
     var mapRef by remember { mutableStateOf<MapLibreMap?>(null) }
     var fetchTrigger by remember { mutableIntStateOf(0) }
+    val isRecording by LocationService.running.collectAsState()
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -104,6 +111,30 @@ fun MapScreen(modifier: Modifier = Modifier) {
         }
     }
 
+    val notificationPermLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { _ ->
+        // Start regardless of grant — notification just won't show if denied.
+        LocationService.start(context)
+    }
+
+    fun toggleRecording() {
+        if (isRecording) {
+            LocationService.stop(context)
+            return
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            val granted = ContextCompat.checkSelfPermission(
+                context, Manifest.permission.POST_NOTIFICATIONS
+            ) == PackageManager.PERMISSION_GRANTED
+            if (!granted) {
+                notificationPermLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                return
+            }
+        }
+        LocationService.start(context)
+    }
+
     val mapView = remember {
         MapLibre.getInstance(context)
         MapView(context).apply {
@@ -114,15 +145,10 @@ fun MapScreen(modifier: Modifier = Modifier) {
                     .target(DEFAULT_CENTER)
                     .zoom(DEFAULT_ZOOM)
                     .build()
-                setOnGenericMotionListener { _, event ->
-                    if (event.action == MotionEvent.ACTION_SCROLL) {
-                        val v = event.getAxisValue(MotionEvent.AXIS_VSCROLL)
-                        val zoomBy = if (v > 0) 0.5 else -0.5
-                        map.animateCamera(CameraUpdateFactory.zoomBy(zoomBy), 150)
-                        true
-                    } else false
-                }
-                map.setStyle(Style.Builder().fromUri(DEMO_STYLE_URL)) { style ->
+                map.setStyle(Style.Builder().fromUri(MAP_STYLE_URL)) { style ->
+                    style.layers.filterIsInstance<FillExtrusionLayer>().forEach {
+                        it.setProperties(PropertyFactory.visibility(Property.NONE))
+                    }
                     style.addSource(GeoJsonSource(USER_LOC_SOURCE_ID))
                     style.addLayer(
                         CircleLayer(USER_LOC_LAYER_ID, USER_LOC_SOURCE_ID).withProperties(
@@ -199,11 +225,20 @@ fun MapScreen(modifier: Modifier = Modifier) {
                 modifier = Modifier.align(Alignment.BottomCenter).padding(16.dp),
             )
         } else {
-            FloatingActionButton(
-                onClick = { fetchTrigger++ },
+            Column(
                 modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
-                Icon(Icons.Filled.LocationOn, contentDescription = "Recenter on my location")
+                FloatingActionButton(onClick = { fetchTrigger++ }) {
+                    Icon(Icons.Filled.LocationOn, contentDescription = "Recenter on my location")
+                }
+                FloatingActionButton(onClick = ::toggleRecording) {
+                    if (isRecording) {
+                        Icon(Icons.Filled.Close, contentDescription = "Stop recording")
+                    } else {
+                        Icon(Icons.Filled.PlayArrow, contentDescription = "Start recording")
+                    }
+                }
             }
         }
     }
