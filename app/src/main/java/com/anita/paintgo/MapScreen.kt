@@ -18,6 +18,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -30,6 +31,7 @@ import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -95,8 +97,17 @@ fun MapScreen(modifier: Modifier = Modifier) {
         )
     }
     var permanentlyDenied by remember { mutableStateOf(false) }
+    var hasBackgroundPermission by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(
+                context, Manifest.permission.ACCESS_BACKGROUND_LOCATION
+            ) == PackageManager.PERMISSION_GRANTED
+        )
+    }
+    var backgroundDeclined by remember { mutableStateOf(false) }
     var userLocation by remember { mutableStateOf<LatLng?>(null) }
     var mapRef by remember { mutableStateOf<MapLibreMap?>(null) }
+    var styleReady by remember { mutableStateOf(false) }
     var fetchTrigger by remember { mutableIntStateOf(0) }
     val isRecording by LocationService.running.collectAsState()
 
@@ -109,6 +120,13 @@ fun MapScreen(modifier: Modifier = Modifier) {
                 activity, Manifest.permission.ACCESS_FINE_LOCATION
             )
         }
+    }
+
+    val backgroundPermLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        hasBackgroundPermission = granted
+        if (!granted) backgroundDeclined = true
     }
 
     val notificationPermLauncher = rememberLauncherForActivityResult(
@@ -158,6 +176,7 @@ fun MapScreen(modifier: Modifier = Modifier) {
                             PropertyFactory.circleStrokeWidth(2f),
                         )
                     )
+                    styleReady = true
                 }
             }
         }
@@ -174,6 +193,11 @@ fun MapScreen(modifier: Modifier = Modifier) {
                     ) == PackageManager.PERMISSION_GRANTED
                     hasPermission = granted
                     if (granted) permanentlyDenied = false
+                    val bgGranted = ContextCompat.checkSelfPermission(
+                        context, Manifest.permission.ACCESS_BACKGROUND_LOCATION
+                    ) == PackageManager.PERMISSION_GRANTED
+                    hasBackgroundPermission = bgGranted
+                    if (bgGranted) backgroundDeclined = false
                 }
                 Lifecycle.Event.ON_PAUSE -> mapView.onPause()
                 Lifecycle.Event.ON_STOP -> mapView.onStop()
@@ -197,14 +221,13 @@ fun MapScreen(modifier: Modifier = Modifier) {
         }
     }
 
-    LaunchedEffect(userLocation, mapRef) {
+    LaunchedEffect(userLocation, mapRef, styleReady) {
         val map = mapRef
         val target = userLocation
-        Log.d("PaintGo", "Apply-location effect: map=${map != null} target=$target")
-        if (map != null && target != null) {
+        Log.d("PaintGo", "Apply-location effect: map=${map != null} target=$target styleReady=$styleReady")
+        if (map != null && target != null && styleReady) {
             map.animateCamera(CameraUpdateFactory.newLatLngZoom(target, USER_ZOOM))
-            val style = map.style
-            val source = style?.getSourceAs<GeoJsonSource>(USER_LOC_SOURCE_ID)
+            val source = map.style?.getSourceAs<GeoJsonSource>(USER_LOC_SOURCE_ID)
             if (source != null) {
                 source.setGeoJson(
                     Feature.fromGeometry(Point.fromLngLat(target.longitude, target.latitude))
@@ -217,26 +240,36 @@ fun MapScreen(modifier: Modifier = Modifier) {
 
     Box(modifier = modifier) {
         AndroidView(factory = { mapView }, modifier = Modifier.fillMaxSize())
-        if (!hasPermission) {
-            PermissionPrompt(
-                permanentlyDenied = permanentlyDenied,
-                onRequest = { permissionLauncher.launch(Manifest.permission.ACCESS_FINE_LOCATION) },
-                onOpenSettings = { openAppSettings(context) },
-                modifier = Modifier.align(Alignment.BottomCenter).padding(16.dp),
-            )
-        } else {
-            Column(
-                modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp),
-            ) {
-                FloatingActionButton(onClick = { fetchTrigger++ }) {
-                    Icon(Icons.Filled.LocationOn, contentDescription = "Recenter on my location")
-                }
-                FloatingActionButton(onClick = ::toggleRecording) {
-                    if (isRecording) {
-                        Icon(Icons.Filled.Close, contentDescription = "Stop recording")
-                    } else {
-                        Icon(Icons.Filled.PlayArrow, contentDescription = "Start recording")
+        when {
+            !hasPermission -> {
+                PermissionPrompt(
+                    permanentlyDenied = permanentlyDenied,
+                    onRequest = { permissionLauncher.launch(Manifest.permission.ACCESS_FINE_LOCATION) },
+                    onOpenSettings = { openAppSettings(context) },
+                    modifier = Modifier.align(Alignment.BottomCenter).padding(16.dp),
+                )
+            }
+            !hasBackgroundPermission && !backgroundDeclined -> {
+                BackgroundPermissionPrompt(
+                    onAllow = { backgroundPermLauncher.launch(Manifest.permission.ACCESS_BACKGROUND_LOCATION) },
+                    onDecline = { backgroundDeclined = true },
+                    modifier = Modifier.align(Alignment.BottomCenter).padding(16.dp),
+                )
+            }
+            else -> {
+                Column(
+                    modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    FloatingActionButton(onClick = { fetchTrigger++ }) {
+                        Icon(Icons.Filled.LocationOn, contentDescription = "Recenter on my location")
+                    }
+                    FloatingActionButton(onClick = ::toggleRecording) {
+                        if (isRecording) {
+                            Icon(Icons.Filled.Close, contentDescription = "Stop recording")
+                        } else {
+                            Icon(Icons.Filled.PlayArrow, contentDescription = "Start recording")
+                        }
                     }
                 }
             }
@@ -266,6 +299,36 @@ private fun PermissionPrompt(
             } else {
                 Text("Show your location on the map?")
                 Button(onClick = onRequest) { Text("Use my location") }
+            }
+        }
+    }
+}
+
+@Composable
+private fun BackgroundPermissionPrompt(
+    onAllow: () -> Unit,
+    onDecline: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Surface(
+        modifier = modifier.fillMaxWidth(),
+        tonalElevation = 4.dp,
+        shadowElevation = 4.dp,
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text(
+                "Let PaintGo track your walks with the screen off? " +
+                    "Choose “Allow all the time” so your route keeps recording when your phone is in your pocket."
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
+            ) {
+                TextButton(onClick = onDecline) { Text("Not now") }
+                Button(onClick = onAllow) { Text("Allow") }
             }
         }
     }

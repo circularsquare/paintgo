@@ -10,6 +10,15 @@ Bare-bones checklist for priority #1 in [SPEC.md](SPEC.md) — a runnable skelet
 - [x] Permission request flow: fine location (background deferred until the foreground service needs it)
 - [x] Room setup: `Owner` / `Session` / `LocationPoint` entities, DAO, database; seed one `Owner` row with `is_self = true` on first launch
 - [x] Foreground service scaffold: persistent notification, starts/stops cleanly (no location logic yet)
-- [ ] Background location permission flow (do when wiring service)
+- [x] Background location permission flow (do when wiring service)
 
-Once all boxes are checked, move on to priority #2 (start/stop recording UI, points persist to DB).
+# Priority #2: recording → DB
+
+- [x] Record FAB in the map UI (already wired to start/stop service)
+- [x] On service start: open `Session` row (ownerId = self, startTime = now)
+- [x] Subscribe to `FusedLocationProviderClient` at 5s, balanced power; filter accuracy > 50m
+- [x] On each fix: insert `LocationPoint` rows into Room
+- [x] On service stop: set `endTime` on the session, unsubscribe
+- [x] Manual verify on emulator: DB rows land in `LocationPoint` tied to a `Session` (confirmed via Database Inspector). Geo-fix → fused propagation is flaky in the emulator; real movement testing will happen on a physical device.
+
+Once verified, move on to priority #3 (fog rendering from points).
