@@ -58,15 +58,21 @@ import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeoutOrNull
+import com.anita.paintgo.data.AppDatabase
+import com.anita.paintgo.fog.computeFog
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import org.maplibre.android.MapLibre
 import org.maplibre.android.camera.CameraPosition
 import org.maplibre.android.camera.CameraUpdateFactory
 import org.maplibre.android.geometry.LatLng
+import org.maplibre.android.geometry.LatLngBounds
 import org.maplibre.android.maps.MapLibreMap
 import org.maplibre.android.maps.MapView
 import org.maplibre.android.maps.Style
 import org.maplibre.android.style.layers.CircleLayer
 import org.maplibre.android.style.layers.FillExtrusionLayer
+import org.maplibre.android.style.layers.FillLayer
 import org.maplibre.android.style.layers.Property
 import org.maplibre.android.style.layers.PropertyFactory
 import org.maplibre.android.style.sources.GeoJsonSource
@@ -81,8 +87,12 @@ private const val DEFAULT_ZOOM = 11.0
 private const val USER_ZOOM = 15.0
 private const val USER_LOC_SOURCE_ID = "user-location-source"
 private const val USER_LOC_LAYER_ID = "user-location-layer"
+private const val FOG_SOURCE_ID = "fog-source"
+private const val FOG_LAYER_ID = "fog-layer"
 private const val LOCATION_TIMEOUT_MS = 15_000L
+private const val LIVE_INTERVAL_MS = 2_000L
 
+@SuppressLint("MissingPermission")
 @Composable
 fun MapScreen(modifier: Modifier = Modifier) {
     val context = LocalContext.current
@@ -109,7 +119,14 @@ fun MapScreen(modifier: Modifier = Modifier) {
     var mapRef by remember { mutableStateOf<MapLibreMap?>(null) }
     var styleReady by remember { mutableStateOf(false) }
     var fetchTrigger by remember { mutableIntStateOf(0) }
+    var centerOnUser by remember { mutableStateOf(true) }
+    var viewportBounds by remember { mutableStateOf<LatLngBounds?>(null) }
     val isRecording by LocationService.running.collectAsState()
+    val liveLocation by LocationService.liveLocation.collectAsState()
+    val pointsFlow = remember(context) {
+        AppDatabase.get(context).locationPointDao().allForSelf()
+    }
+    val points by pointsFlow.collectAsState(initial = emptyList())
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -167,6 +184,15 @@ fun MapScreen(modifier: Modifier = Modifier) {
                     style.layers.filterIsInstance<FillExtrusionLayer>().forEach {
                         it.setProperties(PropertyFactory.visibility(Property.NONE))
                     }
+                    // Fog first so user-location renders on top.
+                    style.addSource(GeoJsonSource(FOG_SOURCE_ID))
+                    style.addLayer(
+                        FillLayer(FOG_LAYER_ID, FOG_SOURCE_ID).withProperties(
+                            PropertyFactory.fillColor("#3F51B5"),
+                            PropertyFactory.fillOpacity(0.45f),
+                            PropertyFactory.fillAntialias(true),
+                        )
+                    )
                     style.addSource(GeoJsonSource(USER_LOC_SOURCE_ID))
                     style.addLayer(
                         CircleLayer(USER_LOC_LAYER_ID, USER_LOC_SOURCE_ID).withProperties(
@@ -177,6 +203,9 @@ fun MapScreen(modifier: Modifier = Modifier) {
                         )
                     )
                     styleReady = true
+                }
+                map.addOnCameraIdleListener {
+                    viewportBounds = map.projection.visibleRegion.latLngBounds
                 }
             }
         }
@@ -221,21 +250,85 @@ fun MapScreen(modifier: Modifier = Modifier) {
         }
     }
 
-    LaunchedEffect(userLocation, mapRef, styleReady) {
-        val map = mapRef
-        val target = userLocation
-        Log.d("PaintGo", "Apply-location effect: map=${map != null} target=$target styleReady=$styleReady")
-        if (map != null && target != null && styleReady) {
-            map.animateCamera(CameraUpdateFactory.newLatLngZoom(target, USER_ZOOM))
-            val source = map.style?.getSourceAs<GeoJsonSource>(USER_LOC_SOURCE_ID)
-            if (source != null) {
-                source.setGeoJson(
-                    Feature.fromGeometry(Point.fromLngLat(target.longitude, target.latitude))
-                )
-            } else {
-                Log.w("PaintGo", "User-location source not found in style")
+    LaunchedEffect(liveLocation) {
+        val ll = liveLocation ?: return@LaunchedEffect
+        userLocation = LatLng(ll.first, ll.second)
+    }
+
+    // Foreground live updates: keep the dot fresh whenever the screen is resumed.
+    // The recording service has its own (denser, persisted) subscription; both can coexist —
+    // Fused dedupes underneath. Disposes on PAUSE so we don't burn battery in the background.
+    DisposableEffect(lifecycleOwner, hasPermission) {
+        if (!hasPermission) {
+            return@DisposableEffect onDispose { }
+        }
+        val client = LocationServices.getFusedLocationProviderClient(context)
+        val callback = object : LocationCallback() {
+            override fun onLocationResult(result: LocationResult) {
+                val loc = result.lastLocation ?: return
+                userLocation = LatLng(loc.latitude, loc.longitude)
             }
         }
+        val request = LocationRequest.Builder(
+            Priority.PRIORITY_BALANCED_POWER_ACCURACY,
+            LIVE_INTERVAL_MS,
+        ).build()
+        var subscribed = false
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_RESUME -> {
+                    if (!subscribed) {
+                        client.requestLocationUpdates(request, callback, Looper.getMainLooper())
+                        subscribed = true
+                    }
+                }
+                Lifecycle.Event.ON_PAUSE -> {
+                    if (subscribed) {
+                        client.removeLocationUpdates(callback)
+                        subscribed = false
+                    }
+                }
+                else -> {}
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            if (subscribed) client.removeLocationUpdates(callback)
+        }
+    }
+
+    LaunchedEffect(userLocation, mapRef, styleReady) {
+        val map = mapRef ?: return@LaunchedEffect
+        val target = userLocation ?: return@LaunchedEffect
+        if (!styleReady) return@LaunchedEffect
+        val source = map.style?.getSourceAs<GeoJsonSource>(USER_LOC_SOURCE_ID)
+        if (source != null) {
+            source.setGeoJson(
+                Feature.fromGeometry(Point.fromLngLat(target.longitude, target.latitude))
+            )
+        } else {
+            Log.w("PaintGo", "User-location source not found in style")
+        }
+    }
+
+    LaunchedEffect(centerOnUser, userLocation, mapRef, styleReady) {
+        if (!centerOnUser) return@LaunchedEffect
+        val map = mapRef ?: return@LaunchedEffect
+        val target = userLocation ?: return@LaunchedEffect
+        if (!styleReady) return@LaunchedEffect
+        map.animateCamera(CameraUpdateFactory.newLatLngZoom(target, USER_ZOOM))
+        centerOnUser = false
+    }
+
+    LaunchedEffect(points, viewportBounds, styleReady) {
+        val bounds = viewportBounds ?: return@LaunchedEffect
+        val map = mapRef ?: return@LaunchedEffect
+        if (!styleReady) return@LaunchedEffect
+        val feature = withContext(Dispatchers.Default) { computeFog(points, bounds) }
+            ?: return@LaunchedEffect
+        val source = map.style?.getSourceAs<GeoJsonSource>(FOG_SOURCE_ID) ?: return@LaunchedEffect
+        source.setGeoJson(feature)
     }
 
     Box(modifier = modifier) {
@@ -261,7 +354,12 @@ fun MapScreen(modifier: Modifier = Modifier) {
                     modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp),
                     verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
-                    FloatingActionButton(onClick = { fetchTrigger++ }) {
+                    FloatingActionButton(
+                        onClick = {
+                            centerOnUser = true
+                            if (!isRecording) fetchTrigger++
+                        }
+                    ) {
                         Icon(Icons.Filled.LocationOn, contentDescription = "Recenter on my location")
                     }
                     FloatingActionButton(onClick = ::toggleRecording) {

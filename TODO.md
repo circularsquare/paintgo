@@ -16,9 +16,23 @@ Bare-bones checklist for priority #1 in [SPEC.md](SPEC.md) — a runnable skelet
 
 - [x] Record FAB in the map UI (already wired to start/stop service)
 - [x] On service start: open `Session` row (ownerId = self, startTime = now)
-- [x] Subscribe to `FusedLocationProviderClient` at 5s, balanced power; filter accuracy > 50m
+- [x] Subscribe to `FusedLocationProviderClient` at 5s, balanced power; filter accuracy > 100m
 - [x] On each fix: insert `LocationPoint` rows into Room
 - [x] On service stop: set `endTime` on the session, unsubscribe
-- [x] Manual verify on emulator: DB rows land in `LocationPoint` tied to a `Session` (confirmed via Database Inspector). Geo-fix → fused propagation is flaky in the emulator; real movement testing will happen on a physical device.
+- [x] Manual verify on emulator: DB rows land in `LocationPoint` tied to a `Session` (confirmed via Database Inspector).
+- [x] 5m grid dedup via unique `(sessionId, cellX, cellY)` index + INSERT OR IGNORE — keeps stationary points from exploding row count.
 
-Once verified, move on to priority #3 (fog rendering from points).
+# Priority #3: fog rendering
+
+- [x] Add JTS for geometric ops
+- [x] `computeFog(points, viewport)` — local equirectangular projection, buffer + union of 50m circles, subtract from viewport, simplify
+- [x] Fog source/layer wired into MapScreen below user-location layer
+- [x] Recompute on point flow updates or camera idle
+
+# Priority #4: stats screen
+
+- [x] Suspend DAO queries: all sessions, all points for self
+- [x] `stats/Stats.kt` — haversine sum per session, totals
+- [x] `StatsScreen.kt` — list view of distance / sessions / longest / time / point count
+- [x] `MainActivity` switches between Map and Stats via TopAppBar; back arrow + system back wired up
+- [ ] Polish: `%` of region explored (needs NYC borough polygons — bigger lift, defer to its own task)

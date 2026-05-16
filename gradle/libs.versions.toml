@@ -12,6 +12,7 @@ maplibre = "11.5.0"
 room = "2.7.0"
 ksp = "2.2.10-2.0.2"
 playServicesLocation = "21.3.0"
+jts = "1.20.0"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
@@ -34,6 +35,7 @@ androidx-room-runtime = { group = "androidx.room", name = "room-runtime", versio
 androidx-room-ktx = { group = "androidx.room", name = "room-ktx", version.ref = "room" }
 androidx-room-compiler = { group = "androidx.room", name = "room-compiler", version.ref = "room" }
 play-services-location = { group = "com.google.android.gms", name = "play-services-location", version.ref = "playServicesLocation" }
+jts-core = { group = "org.locationtech.jts", name = "jts-core", version.ref = "jts" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

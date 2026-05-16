@@ -8,7 +8,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
 
 @Database(
     entities = [Owner::class, Session::class, LocationPoint::class],
-    version = 1,
+    version = 2,
     exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -26,13 +26,22 @@ abstract class AppDatabase : RoomDatabase() {
                 "paintgo.db",
             )
                 .addCallback(SeedCallback)
+                .fallbackToDestructiveMigration(dropAllTables = true)
                 .build()
                 .also { instance = it }
         }
 
         private object SeedCallback : Callback() {
-            override fun onCreate(db: SupportSQLiteDatabase) {
-                db.execSQL("INSERT INTO Owner (displayName, isSelf) VALUES ('You', 1)")
+            // Idempotent seed — runs on every open so it covers fresh installs, destructive
+            // migrations (where onCreate isn't called), and any future stomped-DB scenarios.
+            override fun onOpen(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    INSERT INTO Owner (displayName, isSelf)
+                    SELECT 'You', 1
+                    WHERE NOT EXISTS (SELECT 1 FROM Owner WHERE isSelf = 1)
+                    """.trimIndent()
+                )
             }
         }
     }

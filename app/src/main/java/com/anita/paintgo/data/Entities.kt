@@ -41,7 +41,12 @@ data class Session(
             onDelete = ForeignKey.CASCADE,
         )
     ],
-    indices = [Index("sessionId")],
+    indices = [
+        Index("sessionId"),
+        // Dedup within a session at ~5m resolution. Stationary fixes get squashed;
+        // revisits in later sessions still record (intentional — useful for stats).
+        Index(value = ["sessionId", "cellX", "cellY"], unique = true),
+    ],
 )
 data class LocationPoint(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
@@ -50,4 +55,6 @@ data class LocationPoint(
     val lng: Double,
     val timestamp: Long,
     val accuracy: Float,
+    val cellX: Int,
+    val cellY: Int,
 )

@@ -29,6 +29,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlin.math.floor
 
 class LocationService : Service() {
 
@@ -51,11 +52,14 @@ class LocationService : Service() {
                         lng = loc.longitude,
                         timestamp = loc.time,
                         accuracy = loc.accuracy,
+                        cellX = floor(loc.latitude / GRID_STEP_DEG).toInt(),
+                        cellY = floor(loc.longitude / GRID_STEP_DEG).toInt(),
                     )
                 }
             }
             if (points.isEmpty()) return
             Log.d("PaintGo", "Inserting ${points.size} point(s) into session $sessionId")
+            _liveLocation.value = points.last().let { it.lat to it.lng }
             scope.launch {
                 AppDatabase.get(applicationContext).locationPointDao().insertAll(points)
             }
@@ -117,6 +121,7 @@ class LocationService : Service() {
 
     private fun stopRecording() {
         fusedClient.removeLocationUpdates(locationCallback)
+        _liveLocation.value = null
         val sessionId = currentSessionId ?: return
         currentSessionId = null
         scope.launch {
@@ -154,9 +159,15 @@ class LocationService : Service() {
         // 100m is liberal — emulator fixes are flat 100m, and city GPS can occasionally
         // land here. Revisit once we have real-device traces.
         private const val MAX_ACCURACY_METERS = 100f
+        // ~5m at the equator (constant for lat; ~3.8m E-W at NYC latitude). Cells are
+        // session-unique so stationary points collapse to one row.
+        private const val GRID_STEP_DEG = 4.5e-5
 
         private val _running = MutableStateFlow(false)
         val running: StateFlow<Boolean> = _running.asStateFlow()
+
+        private val _liveLocation = MutableStateFlow<Pair<Double, Double>?>(null)
+        val liveLocation: StateFlow<Pair<Double, Double>?> = _liveLocation.asStateFlow()
 
         fun start(context: Context) {
             ensureChannel(context)
