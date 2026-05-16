@@ -22,5 +22,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "Wisp"
+rootProject.name = "PaintGo"
 include(":app")

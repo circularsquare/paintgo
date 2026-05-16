@@ -1,4 +1,4 @@
-package com.anita.wisp
+package com.anita.paintgo
 
 import android.app.Service
 import android.content.Intent

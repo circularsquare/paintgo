@@ -1,4 +1,4 @@
-# Fog of World — Android App
+# PaintGo — Android App
 
 Android-only. Free, shipping to the Play Store so friends can install it. Eventually social — share progress/maps with friends — but v1 is single-user local.
 

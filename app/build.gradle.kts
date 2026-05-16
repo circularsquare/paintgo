@@ -5,7 +5,7 @@ plugins {
 }
 
 android {
-    namespace = "com.anita.wisp"
+    namespace = "com.anita.paintgo"
     compileSdk {
         version = release(36) {
             minorApiLevel = 1
@@ -13,7 +13,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.anita.wisp"
+        applicationId = "com.anita.paintgo"
         minSdk = 29
         targetSdk = 36
         versionCode = 1
