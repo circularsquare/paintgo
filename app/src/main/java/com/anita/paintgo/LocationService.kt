@@ -8,13 +8,20 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.location.Location
 import android.os.IBinder
 import android.os.Looper
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.ProcessLifecycleOwner
 import com.anita.paintgo.data.AppDatabase
 import com.anita.paintgo.data.LocationPoint
 import com.anita.paintgo.data.Session
+import com.anita.paintgo.data.bandOf
+import com.anita.paintgo.data.cellXOf
+import com.anita.paintgo.data.cellYOf
 import com.google.android.gms.location.FusedLocationProviderClient
 import com.google.android.gms.location.LocationCallback
 import com.google.android.gms.location.LocationRequest
@@ -23,13 +30,24 @@ import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import kotlin.math.floor
+import kotlin.math.max
+
+/** Latest fix surfaced for the live UI — position plus the bits used to draw the
+ *  user marker (accuracy disc, bearing arrow). Bearing is null when the provider
+ *  doesn't report one (e.g. stationary). */
+data class LiveFix(
+    val lat: Double,
+    val lng: Double,
+    val accuracyMeters: Float,
+    val bearing: Float?,
+)
 
 class LocationService : Service() {
 
@@ -37,32 +55,141 @@ class LocationService : Service() {
     private lateinit var fusedClient: FusedLocationProviderClient
 
     @Volatile private var currentSessionId: Long? = null
+    private var intervalJob: Job? = null
+    @Volatile private var subscribed = false
+
+    // Adaptive-polling state. All access goes through synchronized(adaptiveLock) — the
+    // location callback fires on the main looper, the settings-flow collector fires on
+    // IO, and the lifecycle observer fires on main, so reads/writes overlap.
+    private val adaptiveLock = Any()
+    private val recentFixes = ArrayDeque<Location>()
+    private var stationarySinceMs: Long? = null
+    private var isAppForeground = false
+    private var baseIntervalMs: Long = SettingsStore.DEFAULT_SAMPLE_INTERVAL_MS
+    private var currentTargetIntervalMs: Long = 0L
+
+    private val lifecycleObserver = LifecycleEventObserver { _, event ->
+        when (event) {
+            Lifecycle.Event.ON_START -> {
+                synchronized(adaptiveLock) { isAppForeground = true }
+                evaluateInterval()
+            }
+            Lifecycle.Event.ON_STOP -> {
+                synchronized(adaptiveLock) { isAppForeground = false }
+                evaluateInterval()
+            }
+            else -> {}
+        }
+    }
 
     private val locationCallback = object : LocationCallback() {
         override fun onLocationResult(result: LocationResult) {
             val sessionId = currentSessionId ?: return
-            val points = result.locations.mapNotNull { loc ->
-                if (loc.accuracy > MAX_ACCURACY_METERS) {
-                    Log.d("PaintGo", "Skipping low-accuracy fix: ${loc.accuracy}m")
-                    null
-                } else {
-                    LocationPoint(
-                        sessionId = sessionId,
-                        lat = loc.latitude,
-                        lng = loc.longitude,
-                        timestamp = loc.time,
-                        accuracy = loc.accuracy,
-                        cellX = floor(loc.latitude / GRID_STEP_DEG).toInt(),
-                        cellY = floor(loc.longitude / GRID_STEP_DEG).toInt(),
-                    )
-                }
+
+            // Live dot: surface the latest fix at any accuracy so the visible marker
+            // stays responsive when GPS is shaky. The accuracy halo grows to match,
+            // so the user can read the uncertainty visually. Recording / fog writes
+            // below still filter on MAX_ACCURACY_METERS, so noisy fixes don't
+            // reveal fog or pollute the DB.
+            result.lastLocation?.let { loc ->
+                _liveLocation.value = LiveFix(
+                    lat = loc.latitude,
+                    lng = loc.longitude,
+                    accuracyMeters = loc.accuracy,
+                    bearing = if (loc.hasBearing()) loc.bearing else null,
+                )
             }
-            if (points.isEmpty()) return
+
+            val goodFixes = result.locations.filter { loc ->
+                val ok = loc.accuracy <= MAX_ACCURACY_METERS
+                if (!ok) Log.d("PaintGo", "Skipping low-accuracy fix: ${loc.accuracy}m")
+                ok
+            }
+            if (goodFixes.isEmpty()) return
+
+            val points = goodFixes.map { loc ->
+                val band = bandOf(loc.latitude)
+                LocationPoint(
+                    sessionId = sessionId,
+                    lat = loc.latitude,
+                    lng = loc.longitude,
+                    timestamp = loc.time,
+                    accuracy = loc.accuracy,
+                    band = band,
+                    cellX = cellXOf(loc.latitude),
+                    cellY = cellYOf(loc.longitude, band),
+                )
+            }
             Log.d("PaintGo", "Inserting ${points.size} point(s) into session $sessionId")
-            _liveLocation.value = points.last().let { it.lat to it.lng }
             scope.launch {
                 AppDatabase.get(applicationContext).locationPointDao().insertAll(points)
             }
+
+            synchronized(adaptiveLock) {
+                for (loc in goodFixes) {
+                    recentFixes.addLast(loc)
+                    while (recentFixes.size > WINDOW_SIZE) recentFixes.removeFirst()
+                }
+                updateStationaryStateLocked()
+            }
+            evaluateInterval()
+        }
+    }
+
+    /** Caller must hold [adaptiveLock]. Marks the start of a stationary streak (or
+     *  clears it if we're moving). Anchoring to the earliest fix in the window means
+     *  we don't have to wait an extra window-length to ramp down. */
+    private fun updateStationaryStateLocked() {
+        if (isMovingByWindowLocked()) {
+            stationarySinceMs = null
+        } else if (stationarySinceMs == null) {
+            stationarySinceMs = recentFixes.firstOrNull()?.time ?: System.currentTimeMillis()
+        }
+    }
+
+    /** Caller must hold [adaptiveLock]. True when we don't have enough data to judge,
+     *  or when total displacement over the window exceeds the stationary threshold. */
+    private fun isMovingByWindowLocked(): Boolean {
+        if (recentFixes.size < 2) return true
+        val first = recentFixes.first()
+        val last = recentFixes.last()
+        val timeSecs = (last.time - first.time) / 1000.0
+        if (timeSecs < MIN_WINDOW_SECS) return true
+        var dist = 0f
+        var prev = first
+        for (i in 1 until recentFixes.size) {
+            val cur = recentFixes.elementAt(i)
+            dist += prev.distanceTo(cur)
+            prev = cur
+        }
+        val avgSpeedMps = dist / timeSecs.toFloat()
+        return avgSpeedMps >= STATIONARY_SPEED_MPS
+    }
+
+    /** Recompute the desired sample interval from current state; resubscribe iff it
+     *  changed. Cheap to call repeatedly — it's a no-op when the target is stable. */
+    private fun evaluateInterval() {
+        if (currentSessionId == null) return
+        val target: Long
+        val shouldResubscribe: Boolean
+        synchronized(adaptiveLock) {
+            target = computeTargetIntervalLocked()
+            shouldResubscribe = target != currentTargetIntervalMs
+            if (shouldResubscribe) currentTargetIntervalMs = target
+        }
+        if (shouldResubscribe) doResubscribe(target)
+    }
+
+    private fun computeTargetIntervalLocked(): Long {
+        val base = baseIntervalMs
+        if (isAppForeground) return base
+        val since = stationarySinceMs ?: return base
+        val stationaryMs = System.currentTimeMillis() - since
+        return when {
+            stationaryMs < 60_000 -> base
+            stationaryMs < 180_000 -> max(base, 15_000L)
+            stationaryMs < 360_000 -> max(base, 30_000L)
+            else -> max(base, MAX_INTERVAL_MS)
         }
     }
 
@@ -98,6 +225,16 @@ class LocationService : Service() {
 
     @SuppressLint("MissingPermission")
     private fun startRecording() {
+        // Lifecycle observer must be added on main; onStartCommand → here runs on main.
+        val lifecycle = ProcessLifecycleOwner.get().lifecycle
+        synchronized(adaptiveLock) {
+            isAppForeground = lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
+            recentFixes.clear()
+            stationarySinceMs = null
+            currentTargetIntervalMs = 0L
+        }
+        lifecycle.addObserver(lifecycleObserver)
+
         scope.launch {
             val db = AppDatabase.get(applicationContext)
             val self = db.ownerDao().getSelf()
@@ -111,16 +248,48 @@ class LocationService : Service() {
             currentSessionId = sessionId
             Log.d("PaintGo", "Recording started, session=$sessionId")
 
-            val request = LocationRequest.Builder(
-                Priority.PRIORITY_BALANCED_POWER_ACCURACY,
-                LOCATION_INTERVAL_MS,
-            ).build()
-            fusedClient.requestLocationUpdates(request, locationCallback, Looper.getMainLooper())
+            // Track the user-chosen base interval. evaluateInterval() then decides the
+            // actual subscription rate based on app foreground + recent movement, so a
+            // mid-recording settings change just adjusts the floor.
+            intervalJob?.cancel()
+            intervalJob = scope.launch {
+                SettingsStore.get(applicationContext).sampleIntervalMs
+                    .collect { intervalMs ->
+                        synchronized(adaptiveLock) { baseIntervalMs = intervalMs }
+                        evaluateInterval()
+                    }
+            }
         }
     }
 
+    @SuppressLint("MissingPermission")
+    private fun doResubscribe(intervalMs: Long) {
+        if (subscribed) fusedClient.removeLocationUpdates(locationCallback)
+        val request = LocationRequest.Builder(
+            Priority.PRIORITY_BALANCED_POWER_ACCURACY,
+            intervalMs,
+        ).build()
+        fusedClient.requestLocationUpdates(request, locationCallback, Looper.getMainLooper())
+        subscribed = true
+        val (fg, stationaryFor) = synchronized(adaptiveLock) {
+            isAppForeground to stationarySinceMs?.let { System.currentTimeMillis() - it }
+        }
+        Log.d("PaintGo", "Location updates @ ${intervalMs}ms (fg=$fg, stationaryFor=${stationaryFor}ms)")
+    }
+
     private fun stopRecording() {
-        fusedClient.removeLocationUpdates(locationCallback)
+        ProcessLifecycleOwner.get().lifecycle.removeObserver(lifecycleObserver)
+        intervalJob?.cancel()
+        intervalJob = null
+        if (subscribed) {
+            fusedClient.removeLocationUpdates(locationCallback)
+            subscribed = false
+        }
+        synchronized(adaptiveLock) {
+            recentFixes.clear()
+            stationarySinceMs = null
+            currentTargetIntervalMs = 0L
+        }
         _liveLocation.value = null
         val sessionId = currentSessionId ?: return
         currentSessionId = null
@@ -155,19 +324,21 @@ class LocationService : Service() {
         private const val CHANNEL_ID = "paintgo_recording"
         private const val NOTIF_ID = 1
         private const val ACTION_STOP = "com.anita.paintgo.action.STOP"
-        private const val LOCATION_INTERVAL_MS = 5_000L
         // 100m is liberal — emulator fixes are flat 100m, and city GPS can occasionally
         // land here. Revisit once we have real-device traces.
         private const val MAX_ACCURACY_METERS = 100f
-        // ~5m at the equator (constant for lat; ~3.8m E-W at NYC latitude). Cells are
-        // session-unique so stationary points collapse to one row.
-        private const val GRID_STEP_DEG = 4.5e-5
 
+        // Adaptive polling. Hold the last few fixes, judge speed from total displacement
+        // over the window, and slow the request rate when stationary while backgrounded.
+        private const val WINDOW_SIZE = 5
+        private const val MIN_WINDOW_SECS = 20.0
+        private const val STATIONARY_SPEED_MPS = 0.5f
+        private const val MAX_INTERVAL_MS = 60_000L
         private val _running = MutableStateFlow(false)
         val running: StateFlow<Boolean> = _running.asStateFlow()
 
-        private val _liveLocation = MutableStateFlow<Pair<Double, Double>?>(null)
-        val liveLocation: StateFlow<Pair<Double, Double>?> = _liveLocation.asStateFlow()
+        private val _liveLocation = MutableStateFlow<LiveFix?>(null)
+        val liveLocation: StateFlow<LiveFix?> = _liveLocation.asStateFlow()
 
         fun start(context: Context) {
             ensureChannel(context)

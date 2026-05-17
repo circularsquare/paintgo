@@ -4,11 +4,12 @@ import android.content.Context
 import androidx.room.Database
 import androidx.room.Room
 import androidx.room.RoomDatabase
+import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 
 @Database(
     entities = [Owner::class, Session::class, LocationPoint::class],
-    version = 2,
+    version = 4,
     exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -26,9 +27,129 @@ abstract class AppDatabase : RoomDatabase() {
                 "paintgo.db",
             )
                 .addCallback(SeedCallback)
+                .addMigrations(MIGRATION_2_3, MIGRATION_3_4)
                 .fallbackToDestructiveMigration(dropAllTables = true)
                 .build()
                 .also { instance = it }
+        }
+
+        // v2 → v3: introduces banded grid (lat-band-aware cellY). LocationPoint gets a
+        // `band` column and the dedup unique index changes from (sessionId, cellX, cellY)
+        // to (sessionId, band, cellX, cellY). cellX/cellY get recomputed from lat/lng
+        // for every existing row using the new banded formula. INSERT OR IGNORE so any
+        // rows that now collapse to the same new cell silently dedup.
+        private val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE LocationPoint_new (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        sessionId INTEGER NOT NULL,
+                        lat REAL NOT NULL,
+                        lng REAL NOT NULL,
+                        timestamp INTEGER NOT NULL,
+                        accuracy REAL NOT NULL,
+                        band INTEGER NOT NULL,
+                        cellX INTEGER NOT NULL,
+                        cellY INTEGER NOT NULL,
+                        FOREIGN KEY(sessionId) REFERENCES Session(id) ON UPDATE NO ACTION ON DELETE CASCADE
+                    )
+                    """.trimIndent()
+                )
+                // Unique index up front so INSERT OR IGNORE dedupes during the copy.
+                db.execSQL(
+                    "CREATE UNIQUE INDEX index_LocationPoint_new_sessionId_band_cellX_cellY " +
+                        "ON LocationPoint_new(sessionId, band, cellX, cellY)"
+                )
+                db.execSQL(
+                    "CREATE INDEX index_LocationPoint_new_sessionId ON LocationPoint_new(sessionId)"
+                )
+
+                val insert = db.compileStatement(
+                    "INSERT OR IGNORE INTO LocationPoint_new(" +
+                        "id, sessionId, lat, lng, timestamp, accuracy, band, cellX, cellY) " +
+                        "VALUES (?,?,?,?,?,?,?,?,?)"
+                )
+                db.query("SELECT id, sessionId, lat, lng, timestamp, accuracy FROM LocationPoint")
+                    .use { c ->
+                        while (c.moveToNext()) {
+                            val lat = c.getDouble(2)
+                            val lng = c.getDouble(3)
+                            val band = bandOf(lat)
+                            val cx = cellXOf(lat)
+                            val cy = cellYOf(lng, band)
+                            insert.clearBindings()
+                            insert.bindLong(1, c.getLong(0))
+                            insert.bindLong(2, c.getLong(1))
+                            insert.bindDouble(3, lat)
+                            insert.bindDouble(4, lng)
+                            insert.bindLong(5, c.getLong(4))
+                            insert.bindDouble(6, c.getDouble(5))
+                            insert.bindLong(7, band.toLong())
+                            insert.bindLong(8, cx.toLong())
+                            insert.bindLong(9, cy.toLong())
+                            insert.executeInsert()
+                        }
+                    }
+
+                db.execSQL("DROP TABLE LocationPoint")
+                db.execSQL("ALTER TABLE LocationPoint_new RENAME TO LocationPoint")
+                // SQLite carries indexes across the rename, but their names still say
+                // "_new_". Drop + recreate so Room finds the names it expects.
+                db.execSQL("DROP INDEX IF EXISTS index_LocationPoint_new_sessionId_band_cellX_cellY")
+                db.execSQL("DROP INDEX IF EXISTS index_LocationPoint_new_sessionId")
+                db.execSQL(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS index_LocationPoint_sessionId_band_cellX_cellY " +
+                        "ON LocationPoint(sessionId, band, cellX, cellY)"
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS index_LocationPoint_sessionId ON LocationPoint(sessionId)"
+                )
+            }
+        }
+
+        // v3 → v4: shrinks the latitude band size (10° → 5°), which halves the within-
+        // band aspect-ratio skew of dedup cells. Schema is identical; only band/cellX/
+        // cellY values change. Recompute in place: drop the unique index so duplicates
+        // don't block UPDATE, rewrite cells per row, dedup-and-delete keeping min(id)
+        // per (sessionId, band, cellX, cellY), then re-create the unique index.
+        private val MIGRATION_3_4 = object : Migration(3, 4) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("DROP INDEX IF EXISTS index_LocationPoint_sessionId_band_cellX_cellY")
+
+                val update = db.compileStatement(
+                    "UPDATE LocationPoint SET band = ?, cellX = ?, cellY = ? WHERE id = ?"
+                )
+                db.query("SELECT id, lat, lng FROM LocationPoint").use { c ->
+                    while (c.moveToNext()) {
+                        val id = c.getLong(0)
+                        val lat = c.getDouble(1)
+                        val lng = c.getDouble(2)
+                        val band = bandOf(lat)
+                        val cx = cellXOf(lat)
+                        val cy = cellYOf(lng, band)
+                        update.clearBindings()
+                        update.bindLong(1, band.toLong())
+                        update.bindLong(2, cx.toLong())
+                        update.bindLong(3, cy.toLong())
+                        update.bindLong(4, id)
+                        update.executeUpdateDelete()
+                    }
+                }
+                db.execSQL(
+                    """
+                    DELETE FROM LocationPoint
+                    WHERE id NOT IN (
+                        SELECT MIN(id) FROM LocationPoint
+                        GROUP BY sessionId, band, cellX, cellY
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS index_LocationPoint_sessionId_band_cellX_cellY " +
+                        "ON LocationPoint(sessionId, band, cellX, cellY)"
+                )
+            }
         }
 
         private object SeedCallback : Callback() {

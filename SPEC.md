@@ -96,3 +96,20 @@ None of this blocks v1 dev; tackle at the end before the first internal-track up
 8. Social: import a friend's exported file, render their fog alongside yours, compare stats
 
 Ask me before making architectural decisions I haven't specified. Use the Kotlin ecosystem defaults (Coroutines, Flow, Hilt if DI is needed). Don't over-engineer, but keep the data model and code free of hard assumptions that would block a later social/multi-device feature.
+
+
+
+
+
+other misc todos written by anita
+- improve country and state borders
+  - dynamically pull borders from osm?
+- can we calculate speed / find whether biking / walking / train?
+- train integration... if detected on a train, special handle the train stops and tracks to show perfectly 
+- add exporting 
+- make prettier
+- chunking?
+
+- store stats (not just which ones to show, but also stats values for faraway places)
+- snap to street? 
+- interpolate points??

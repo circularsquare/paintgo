@@ -45,7 +45,10 @@ data class Session(
         Index("sessionId"),
         // Dedup within a session at ~5m resolution. Stationary fixes get squashed;
         // revisits in later sessions still record (intentional — useful for stats).
-        Index(value = ["sessionId", "cellX", "cellY"], unique = true),
+        // band is part of the key because cellY's meters-per-unit depends on the band's
+        // representative latitude; a point at lat 49.9 and a point at lat 50.1 are in
+        // different cells even if their lng matches.
+        Index(value = ["sessionId", "band", "cellX", "cellY"], unique = true),
     ],
 )
 data class LocationPoint(
@@ -55,6 +58,7 @@ data class LocationPoint(
     val lng: Double,
     val timestamp: Long,
     val accuracy: Float,
+    val band: Int,
     val cellX: Int,
     val cellY: Int,
 )
