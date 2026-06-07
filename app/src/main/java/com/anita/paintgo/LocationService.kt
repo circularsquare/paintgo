@@ -8,6 +8,10 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.hardware.Sensor
+import android.hardware.SensorManager
+import android.hardware.TriggerEvent
+import android.hardware.TriggerEventListener
 import android.location.Location
 import android.os.IBinder
 import android.os.Looper
@@ -32,6 +36,7 @@ import com.google.android.gms.location.Priority
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -68,6 +73,19 @@ class LocationService : Service() {
     private var isAppForeground = false
     private var baseIntervalMs: Long = SettingsStore.DEFAULT_SAMPLE_INTERVAL_MS
     private var currentTargetIntervalMs: Long = 0L
+    // -1 = "no request live yet" so the first evaluate always resubscribes (0 is a
+    // valid delay — foreground/no-batching — and would otherwise look unchanged).
+    private var currentMaxDelayMs: Long = -1L
+
+    // Dormancy: when deeply stationary + backgrounded we drop GPS entirely and sleep on
+    // the hardware significant-motion trigger, with a periodic safety poll as a backstop.
+    private lateinit var sensorManager: SensorManager
+    private var sigMotionSensor: Sensor? = null
+    private var sigMotionAvailable = false
+    @Volatile private var sigMotionArmed = false
+    @Volatile private var dormant = false
+    @Volatile private var dormantAnchor: Location? = null
+    private var safetyPollJob: Job? = null
 
     private val lifecycleObserver = LifecycleEventObserver { _, event ->
         when (event) {
@@ -80,6 +98,17 @@ class LocationService : Service() {
                 evaluateInterval()
             }
             else -> {}
+        }
+    }
+
+    /** Fired once by the hardware significant-motion sensor while we're dormant. The
+     *  sensor disarms itself on fire, so we just resume and re-arm if we sleep again. */
+    private val motionTriggerListener = object : TriggerEventListener() {
+        override fun onTrigger(event: TriggerEvent?) {
+            Log.d("PaintGo", "Significant motion — resuming from dormant")
+            sigMotionArmed = false
+            exitDormant()
+            evaluateInterval()
         }
     }
 
@@ -111,7 +140,12 @@ class LocationService : Service() {
     private fun ingestFixes(locations: List<Location>) {
         val sessionId = currentSessionId ?: return
 
-        val goodFixes = locations.filter { loc ->
+        // Batched delivery (setMaxUpdateDelayMillis) can hand back fixes out of order;
+        // non-batched delivery is monotonic. Sort by the monotonic boot clock before
+        // we fold them into the movement window, which assumes chronological order.
+        val ordered = locations.sortedBy { it.elapsedRealtimeNanos }
+
+        val goodFixes = ordered.filter { loc ->
             val ok = loc.accuracy <= MAX_ACCURACY_METERS
             if (!ok) Log.d("PaintGo", "Skipping low-accuracy fix: ${loc.accuracy}m")
             ok
@@ -204,34 +238,169 @@ class LocationService : Service() {
      *  changed. Cheap to call repeatedly — it's a no-op when the target is stable. */
     private fun evaluateInterval() {
         if (currentSessionId == null) return
+
+        // Deepest rung of the ramp: backgrounded + long-stationary + the sensor exists →
+        // drop GPS entirely and wait for a significant-motion wake instead of polling.
+        if (synchronized(adaptiveLock) { shouldBeDormantLocked() }) {
+            enterDormant()
+            return
+        }
+        // Not (or no longer) dormant. If we were, wake up first — exitDormant() resets
+        // the movement window so the interval below comes from fresh post-wake fixes.
+        if (dormant) exitDormant()
+
         val target: Long
+        val maxDelay: Long
         val shouldResubscribe: Boolean
         synchronized(adaptiveLock) {
             target = computeTargetIntervalLocked()
-            shouldResubscribe = target != currentTargetIntervalMs
-            if (shouldResubscribe) currentTargetIntervalMs = target
+            maxDelay = computeMaxDelayLocked(target)
+            shouldResubscribe = target != currentTargetIntervalMs || maxDelay != currentMaxDelayMs
+            if (shouldResubscribe) {
+                currentTargetIntervalMs = target
+                currentMaxDelayMs = maxDelay
+            }
         }
-        if (shouldResubscribe) doResubscribe(target)
+        if (shouldResubscribe) doResubscribe(target, maxDelay)
+    }
+
+    /** Caller must hold [adaptiveLock]. How long FusedLocation may buffer fixes before
+     *  delivering them in one batched callback. Foreground → 0: deliver each fix
+     *  immediately so the live dot tracks. Backgrounded → at least
+     *  BACKGROUND_BATCH_WINDOW_MS, so the chip buffers several fixes and the CPU wakes
+     *  in bursts instead of once per fix. The sampling rate ([intervalMs]) is unchanged
+     *  either way — only delivery timing differs. */
+    private fun computeMaxDelayLocked(intervalMs: Long): Long {
+        if (isAppForeground) return 0L
+        return max(intervalMs, BACKGROUND_BATCH_WINDOW_MS)
     }
 
     private fun computeTargetIntervalLocked(): Long {
         val base = baseIntervalMs
-        if (isAppForeground) return base
+        // No movement baseline yet → sample at the user's chosen rate.
         val since = stationarySinceMs ?: return base
         val stationaryMs = System.currentTimeMillis() - since
-        return when {
+        // Foreground keeps a faster floor than background: the live dot is on-screen, so
+        // ramp down only as far as FOREGROUND_MAX_INTERVAL_MS instead of all the way to
+        // MAX_INTERVAL_MS. Backgrounded + stationary can go fully slow — nobody's watching.
+        // base always wins if the user picked a coarser rate than the ramp.
+        val cap = if (isAppForeground) FOREGROUND_MAX_INTERVAL_MS else MAX_INTERVAL_MS
+        val ramped = when {
             stationaryMs < 60_000 -> base
-            stationaryMs < 180_000 -> max(base, 15_000L)
-            stationaryMs < 360_000 -> max(base, 30_000L)
-            else -> max(base, MAX_INTERVAL_MS)
+            stationaryMs < 180_000 -> 15_000L
+            stationaryMs < 360_000 -> 30_000L
+            else -> MAX_INTERVAL_MS
         }
+        return max(base, ramped.coerceAtMost(cap))
+    }
+
+    /** Caller must hold [adaptiveLock]. True when we should drop GPS and sleep on the
+     *  motion sensor: backgrounded, stationary past the threshold, and the hardware
+     *  trigger exists. Foreground stays live; no sensor → we fall back to slow polling. */
+    private fun shouldBeDormantLocked(): Boolean {
+        if (!sigMotionAvailable || isAppForeground) return false
+        val since = stationarySinceMs ?: return false
+        return System.currentTimeMillis() - since >= DORMANT_AFTER_MS
+    }
+
+    /** Stop GPS, arm the one-shot significant-motion trigger, and start the safety-poll
+     *  backstop. Idempotent. The radio stays off until motion wakes us or a safety poll
+     *  detects displacement the inertial sensor missed (e.g. a smoothly-cruising train). */
+    private fun enterDormant() {
+        synchronized(adaptiveLock) {
+            if (dormant) return
+            dormant = true
+            dormantAnchor = recentFixes.lastOrNull()
+            currentTargetIntervalMs = 0L
+            currentMaxDelayMs = -1L
+        }
+        if (subscribed) {
+            fusedClient.removeLocationUpdates(locationCallback)
+            subscribed = false
+        }
+        armSignificantMotion()
+        startSafetyPoll()
+        updateNotification(dormant = true)
+        Log.d("PaintGo", "Entering dormant — GPS off, sig-motion armed")
+    }
+
+    /** Resume from dormancy: disarm the trigger, stop the safety poll, and clear the
+     *  movement window so stale pre-sleep fixes don't poison the speed estimate. The
+     *  caller re-subscribes GPS (via evaluateInterval). Idempotent. */
+    private fun exitDormant() {
+        synchronized(adaptiveLock) {
+            if (!dormant) return
+            dormant = false
+            dormantAnchor = null
+            recentFixes.clear()
+            stationarySinceMs = null
+        }
+        disarmSignificantMotion()
+        stopSafetyPoll()
+        updateNotification(dormant = false)
+        Log.d("PaintGo", "Exiting dormant — resuming GPS")
+    }
+
+    private fun armSignificantMotion() {
+        val sensor = sigMotionSensor ?: return
+        if (sigMotionArmed) return
+        sigMotionArmed = sensorManager.requestTriggerSensor(motionTriggerListener, sensor)
+        Log.d("PaintGo", "Sig-motion arm requested: $sigMotionArmed")
+    }
+
+    private fun disarmSignificantMotion() {
+        val sensor = sigMotionSensor ?: return
+        if (!sigMotionArmed) return
+        sensorManager.cancelTriggerSensor(motionTriggerListener, sensor)
+        sigMotionArmed = false
+    }
+
+    /** While dormant, take a coarse fix every [SAFETY_POLL_MS] as a backstop: if we've
+     *  displaced past [DORMANT_WAKE_DISTANCE_M] from where we parked, the motion sensor
+     *  missed real travel (e.g. a smooth vehicle), so wake and resume normal recording. */
+    private fun startSafetyPoll() {
+        safetyPollJob?.cancel()
+        safetyPollJob = scope.launch {
+            while (dormant) {
+                delay(SAFETY_POLL_MS)
+                if (!dormant) break
+                safetyPollOnce()
+            }
+        }
+    }
+
+    private fun stopSafetyPoll() {
+        safetyPollJob?.cancel()
+        safetyPollJob = null
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun safetyPollOnce() {
+        if (!dormant) return
+        fusedClient.getCurrentLocation(Priority.PRIORITY_BALANCED_POWER_ACCURACY, null)
+            .addOnSuccessListener { loc ->
+                if (loc == null || !dormant) return@addOnSuccessListener
+                val anchor = dormantAnchor
+                if (anchor != null && loc.distanceTo(anchor) >= DORMANT_WAKE_DISTANCE_M) {
+                    Log.d("PaintGo", "Safety poll: moved ${loc.distanceTo(anchor)}m while dormant — waking")
+                    exitDormant()
+                    evaluateInterval()
+                } else {
+                    // Still parked (or GPS jitter); re-anchor and keep sleeping.
+                    dormantAnchor = loc
+                }
+            }
+            .addOnFailureListener { Log.w("PaintGo", "Safety poll failed", it) }
     }
 
     override fun onCreate() {
         super.onCreate()
         ensureChannel(this)
         fusedClient = LocationServices.getFusedLocationProviderClient(this)
-        Log.d("PaintGo", "LocationService onCreate")
+        sensorManager = getSystemService(SensorManager::class.java)
+        sigMotionSensor = sensorManager.getDefaultSensor(Sensor.TYPE_SIGNIFICANT_MOTION)
+        sigMotionAvailable = sigMotionSensor != null
+        Log.d("PaintGo", "LocationService onCreate (sigMotion=$sigMotionAvailable)")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -273,7 +442,10 @@ class LocationService : Service() {
             recentFixes.clear()
             stationarySinceMs = null
             currentTargetIntervalMs = 0L
+            currentMaxDelayMs = -1L
         }
+        dormant = false
+        dormantAnchor = null
         lifecycle.addObserver(lifecycleObserver)
 
         scope.launch {
@@ -304,24 +476,30 @@ class LocationService : Service() {
     }
 
     @SuppressLint("MissingPermission")
-    private fun doResubscribe(intervalMs: Long) {
+    private fun doResubscribe(intervalMs: Long, maxDelayMs: Long) {
         if (subscribed) fusedClient.removeLocationUpdates(locationCallback)
+        // maxUpdateDelay > interval lets FusedLocation batch fixes and deliver them in
+        // bursts (fewer CPU wakeups when backgrounded). 0 = no batching (foreground).
         val request = LocationRequest.Builder(
             Priority.PRIORITY_BALANCED_POWER_ACCURACY,
             intervalMs,
-        ).build()
+        ).setMaxUpdateDelayMillis(maxDelayMs).build()
         fusedClient.requestLocationUpdates(request, locationCallback, Looper.getMainLooper())
         subscribed = true
         val (fg, stationaryFor) = synchronized(adaptiveLock) {
             isAppForeground to stationarySinceMs?.let { System.currentTimeMillis() - it }
         }
-        Log.d("PaintGo", "Location updates @ ${intervalMs}ms (fg=$fg, stationaryFor=${stationaryFor}ms)")
+        Log.d("PaintGo", "Location updates @ ${intervalMs}ms (maxDelay=${maxDelayMs}ms, fg=$fg, stationaryFor=${stationaryFor}ms)")
     }
 
     private fun stopRecording() {
         ProcessLifecycleOwner.get().lifecycle.removeObserver(lifecycleObserver)
         intervalJob?.cancel()
         intervalJob = null
+        disarmSignificantMotion()
+        stopSafetyPoll()
+        dormant = false
+        dormantAnchor = null
         if (subscribed) {
             fusedClient.removeLocationUpdates(locationCallback)
             subscribed = false
@@ -330,6 +508,7 @@ class LocationService : Service() {
             recentFixes.clear()
             stationarySinceMs = null
             currentTargetIntervalMs = 0L
+            currentMaxDelayMs = -1L
         }
         _liveLocation.value = null
         val sessionId = currentSessionId ?: return
@@ -352,14 +531,21 @@ class LocationService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    private fun buildNotification(): Notification =
+    private fun buildNotification(dormant: Boolean = false): Notification =
         NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("PaintGo")
-            .setContentText("Recording your walk")
+            .setContentText(if (dormant) "Paused — waiting for movement" else "Recording your walk")
             .setSmallIcon(android.R.drawable.ic_menu_mylocation)
             .setOngoing(true)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .build()
+
+    /** Refresh the ongoing notification text in place (same NOTIF_ID) without
+     *  re-entering startForeground. */
+    private fun updateNotification(dormant: Boolean) {
+        getSystemService(NotificationManager::class.java)
+            .notify(NOTIF_ID, buildNotification(dormant))
+    }
 
     companion object {
         private const val CHANNEL_ID = "paintgo_recording"
@@ -376,6 +562,21 @@ class LocationService : Service() {
         private const val MIN_WINDOW_SECS = 20.0
         private const val STATIONARY_SPEED_MPS = 0.5f
         private const val MAX_INTERVAL_MS = 60_000L
+        // Foreground ramp-down floor: stationary + on-screen slows to this (vs MAX_INTERVAL_MS
+        // backgrounded) so the live dot stays reasonably responsive. Tune freely.
+        private const val FOREGROUND_MAX_INTERVAL_MS = 15_000L
+        // Backgrounded batching window: FusedLocation may buffer fixes up to this long and
+        // deliver them in one callback, so the CPU wakes in bursts. Bounds fog latency to
+        // ~this while backgrounded; foreground uses 0 (no batching).
+        private const val BACKGROUND_BATCH_WINDOW_MS = 30_000L
+        // Dormancy: backgrounded + stationary this long → drop GPS and sleep on the
+        // significant-motion sensor (matches the deepest polling rung it replaces).
+        private const val DORMANT_AFTER_MS = 360_000L
+        // Backstop while dormant: poll a coarse fix this often and wake if we've moved
+        // past DORMANT_WAKE_DISTANCE_M — covers smooth-vehicle motion the inertial sensor
+        // can miss, plus device-to-device sensor-sensitivity variance.
+        private const val SAFETY_POLL_MS = 600_000L
+        private const val DORMANT_WAKE_DISTANCE_M = 100f
         private val _running = MutableStateFlow(false)
         val running: StateFlow<Boolean> = _running.asStateFlow()
 

@@ -90,6 +90,10 @@ fun BackupsScreen(modifier: Modifier = Modifier) {
 
     LaunchedEffect(Unit) { reload() }
 
+    // Any DB operation in flight disables the others. BackupManager also serializes them
+    // with a mutex; this just keeps the UI from queueing a second one.
+    val busy = creating || restoring
+
     Column(
         modifier = modifier
             .fillMaxSize()
@@ -111,7 +115,7 @@ fun BackupsScreen(modifier: Modifier = Modifier) {
                     }
                 }
             },
-            enabled = !creating,
+            enabled = !busy,
             modifier = Modifier.fillMaxWidth(),
         ) {
             if (creating) {
@@ -147,7 +151,7 @@ fun BackupsScreen(modifier: Modifier = Modifier) {
                 items(list, key = { it.name }) { backup ->
                     BackupRow(
                         backup,
-                        enabled = !restoring,
+                        enabled = !busy,
                         onRestore = { pendingRestore = backup },
                         onDelete = { pendingDelete = backup },
                     )

@@ -7,6 +7,10 @@ import androidx.room.RoomDatabase
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 
+// Single source of truth for the schema version: used in the @Database annotation and by
+// backup restore's compatibility guard. Bump this in lockstep with any new migration.
+internal const val PAINTGO_SCHEMA_VERSION = 6
+
 @Database(
     entities = [
         Owner::class,
@@ -17,7 +21,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         ChunkFog::class,
         SessionStat::class,
     ],
-    version = 6,
+    version = PAINTGO_SCHEMA_VERSION,
     exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -34,6 +38,13 @@ abstract class AppDatabase : RoomDatabase() {
 
         const val DB_NAME = "paintgo.db"
 
+        // The migration chain, shared so get() and buildStrict() can never drift apart — a
+        // migration added to one but not the other would make a version that opens fine
+        // normally throw (or silently wipe) under the other path. A getter sidesteps
+        // companion-init ordering against the migration vals declared further down.
+        private val MIGRATIONS: Array<Migration>
+            get() = arrayOf(MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6)
+
         fun get(context: Context): AppDatabase = instance ?: synchronized(this) {
             instance ?: Room.databaseBuilder(
                 context.applicationContext,
@@ -41,11 +52,22 @@ abstract class AppDatabase : RoomDatabase() {
                 DB_NAME,
             )
                 .addCallback(SeedCallback)
-                .addMigrations(MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6)
+                .addMigrations(*MIGRATIONS)
                 .fallbackToDestructiveMigration(dropAllTables = true)
                 .build()
                 .also { instance = it }
         }
+
+        // A throwaway instance bound to [name], built with the SAME migrations but WITHOUT
+        // destructive fallback — so an incompatible schema (bad/missing migration path,
+        // identity-hash mismatch) THROWS instead of silently dropping all tables. Backup
+        // restore opens the candidate file this way first, to prove the real reopen won't
+        // wipe before it ever becomes the live DB. Caller owns closing it.
+        fun buildStrict(context: Context, name: String): AppDatabase =
+            Room.databaseBuilder(context.applicationContext, AppDatabase::class.java, name)
+                .addCallback(SeedCallback)
+                .addMigrations(*MIGRATIONS)
+                .build()
 
         // Close the open database and drop the cached instance so the next get() reopens
         // it from disk. Used by backup restore, which swaps the underlying .db file out
