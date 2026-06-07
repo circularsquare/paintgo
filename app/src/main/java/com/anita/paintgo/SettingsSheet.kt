@@ -68,6 +68,7 @@ private enum class ViewModeChoice(val mode: ViewMode, val label: String) {
 fun SettingsSheet(
     onDismiss: () -> Unit,
     onEnterDeleteMode: () -> Unit,
+    onOpenBackups: () -> Unit,
 ) {
     val context = LocalContext.current
     val store = remember(context) { SettingsStore.get(context) }
@@ -167,6 +168,11 @@ fun SettingsSheet(
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text("Delete points mode", style = MaterialTheme.typography.titleMedium)
                 OutlinedButton(onClick = onEnterDeleteMode) { Text("Enter") }
+            }
+
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text("Backups", style = MaterialTheme.typography.titleMedium)
+                OutlinedButton(onClick = onOpenBackups) { Text("Manage backups") }
             }
 
             Spacer(Modifier.height(4.dp))

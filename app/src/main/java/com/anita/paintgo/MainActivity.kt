@@ -30,7 +30,7 @@ import androidx.compose.ui.res.painterResource
 import com.anita.paintgo.data.AppDatabase
 import com.anita.paintgo.ui.theme.PaintGoTheme
 
-private enum class Screen { Map, Stats }
+private enum class Screen { Map, Stats, Backups }
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -67,7 +67,7 @@ private fun AppRoot() {
     // the delete-mode flow (selection, confirm dialog) since nothing outside it cares.
     var deleteMode by remember { mutableStateOf(false) }
 
-    if (screen == Screen.Stats) {
+    if (screen != Screen.Map) {
         BackHandler { screen = Screen.Map }
     }
 
@@ -91,6 +91,14 @@ private fun AppRoot() {
                 )
                 Screen.Stats -> TopAppBar(
                     title = { Text("Stats") },
+                    navigationIcon = {
+                        IconButton(onClick = { screen = Screen.Map }) {
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                        }
+                    },
+                )
+                Screen.Backups -> TopAppBar(
+                    title = { Text("Backups") },
                     navigationIcon = {
                         IconButton(onClick = { screen = Screen.Map }) {
                             Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
@@ -121,6 +129,11 @@ private fun AppRoot() {
                     StatsScreen(modifier = Modifier.fillMaxSize())
                 }
             }
+            if (screen == Screen.Backups) {
+                Surface(modifier = Modifier.fillMaxSize()) {
+                    BackupsScreen(modifier = Modifier.fillMaxSize())
+                }
+            }
         }
     }
 
@@ -129,6 +142,10 @@ private fun AppRoot() {
             onDismiss = { settingsOpen = false },
             onEnterDeleteMode = {
                 deleteMode = true
+                settingsOpen = false
+            },
+            onOpenBackups = {
+                screen = Screen.Backups
                 settingsOpen = false
             },
         )

@@ -32,65 +32,53 @@ import kotlin.math.floor
 import kotlin.math.log10
 import com.anita.paintgo.data.AppDatabase
 import com.anita.paintgo.regions.RegionKind
-import com.anita.paintgo.regions.RegionRegistry
 import com.anita.paintgo.regions.RegionStat
-import com.anita.paintgo.regions.VisitedRegions
 import com.anita.paintgo.stats.StatsCache
+import com.anita.paintgo.stats.StatsEngine
 import com.anita.paintgo.stats.WalkStats
-import com.anita.paintgo.stats.computeStats
 
 @Composable
 fun StatsScreen(modifier: Modifier = Modifier) {
     val context = LocalContext.current
-    // Live updates: same selfPointCount Flow the map's fog uses. Each new fix bumps
-    // the count, this effect re-runs, stats recompute. computeStats runs on
-    // Dispatchers.Default so the per-tick cost (~1s at NYC scale) doesn't block UI.
+    // Live updates: same selfPointCount Flow the map's fog uses. Each new fix bumps the
+    // count and this effect re-runs.
     val pointTickFlow = remember(context) {
         AppDatabase.get(context).locationPointDao().selfPointCount()
     }
     val pointTick by pointTickFlow.collectAsState(initial = 0L)
-    // Seed from the on-disk cache so the screen renders last-known values on the
-    // first frame. Fast pass + full pass below overwrite this with fresh numbers
-    // as they finish.
+    // Seed from the on-disk cache so the screen renders last-known values on the first
+    // frame; the refresh below overwrites with fresh numbers as it finishes.
     var stats by remember { mutableStateOf<WalkStats?>(StatsCache.loadBlocking(context)) }
-    // Visited region keys, loaded once from prefs and updated by the background full
-    // scan. Held in state so the fast pass re-runs whenever the set grows.
-    var visited by remember { mutableStateOf<Set<String>?>(null) }
-    LaunchedEffect(Unit) {
-        visited = VisitedRegions.load(context)
-    }
+    // True while a refresh is in flight — drives the "Loading…" indicator. The first
+    // refresh after an app update can take a while (region geometry re-parse).
+    var refreshing by remember { mutableStateOf(false) }
 
-    // Fast pass: only loads geometry + PIPs the regions we already know are visited
-    // (plus nyc-boroughs, force-loaded by RegionRegistry for synthesis). Re-runs on
-    // every new point and whenever the background scan grows [visited].
-    LaunchedEffect(pointTick, visited) {
-        val v = visited ?: return@LaunchedEffect
-        val db = AppDatabase.get(context)
-        val fastRegions = RegionRegistry.regionsFromCache(context) { src, eid ->
-            VisitedRegions.key(src, eid) in v
+    // Incremental recompute: StatsEngine recomputes only the chunks (and sessions)
+    // dirtied since the last pass, then sums the cached rows — cost is flat in total
+    // history. Region discovery is folded in (a region is "visited" iff it has chunk
+    // rows), so the old fast-pass / full-scan / VisitedRegions dance is gone. Runs on
+    // Dispatchers.Default inside refresh(), so it never blocks the UI thread.
+    LaunchedEffect(pointTick) {
+        val prev = stats
+        refreshing = true
+        val fresh = try {
+            StatsEngine.refresh(context, AppDatabase.get(context))
+        } finally {
+            refreshing = false
         }
-        val fresh = computeStats(db, fastRegions)
-        stats = fresh
-        StatsCache.save(context, fresh)
-    }
-
-    // Background full scan: walks every bundled region once per screen open to catch
-    // regions the user has newly entered. Updates the persistent set so the next fast
-    // pass picks them up. Only one slow scan per screen open — debounced by keying on
-    // Unit, not pointTick, so we don't re-scan all 250 countries on every GPS fix.
-    LaunchedEffect(Unit) {
-        val db = AppDatabase.get(context)
-        val full = RegionRegistry.regions(context)
-        if (full.isEmpty()) return@LaunchedEffect
-        val fullStats = computeStats(db, full)
-        stats = fullStats
-        StatsCache.save(context, fullStats)
-        val touched = fullStats.regionCoverage.mapTo(HashSet()) { it.key }
-        val current = visited ?: VisitedRegions.load(context)
-        if (current != touched) {
-            VisitedRegions.save(context, touched)
-            visited = touched
+        // If a refresh couldn't load region geometry yet (cold cache mid-reload after an
+        // app update), it returns distance + area but empty percentages. Keep the
+        // last-known percentages on screen instead of blanking them; the next refresh
+        // fills them in once geometry is ready.
+        val merged = if (fresh.regionCoverage.isEmpty() && prev != null &&
+            prev.regionCoverage.isNotEmpty()
+        ) {
+            fresh.copy(regionCoverage = prev.regionCoverage)
+        } else {
+            fresh
         }
+        stats = merged
+        StatsCache.save(context, merged)
     }
 
     Column(
@@ -104,6 +92,15 @@ fun StatsScreen(modifier: Modifier = Modifier) {
         if (s == null) {
             Text("Loading…", style = MaterialTheme.typography.bodyLarge)
             return@Column
+        }
+        // Refreshing with values already on screen — a quiet inline note rather than
+        // replacing the whole screen.
+        if (refreshing) {
+            Text(
+                "Loading…",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
         Row("Total distance", formatKm(s.totalKm))
         HorizontalDivider()

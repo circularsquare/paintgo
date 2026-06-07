@@ -2,10 +2,13 @@ package com.anita.paintgo.fog
 
 import com.anita.paintgo.data.LocationPoint
 import org.locationtech.jts.geom.Coordinate
+import org.locationtech.jts.geom.CoordinateFilter
 import org.locationtech.jts.geom.Geometry
 import org.locationtech.jts.geom.GeometryFactory
 import org.locationtech.jts.geom.MultiPolygon
 import org.locationtech.jts.geom.Polygon
+import org.locationtech.jts.io.WKBReader
+import org.locationtech.jts.io.WKBWriter
 import org.locationtech.jts.operation.union.UnaryUnionOp
 import org.locationtech.jts.simplify.DouglasPeuckerSimplifier
 import org.maplibre.android.geometry.LatLngBounds
@@ -16,7 +19,6 @@ import org.maplibre.geojson.Polygon as GjPolygon
 import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.hypot
-import kotlin.math.max
 
 private const val EARTH_RADIUS_M = 6_378_137.0
 private const val METERS_PER_DEG = EARTH_RADIUS_M * PI / 180.0
@@ -27,137 +29,167 @@ private const val METERS_PER_DEG = EARTH_RADIUS_M * PI / 180.0
 internal const val MAX_RUN_GAP_MS = 150_000L
 internal const val MAX_RUN_SEGMENT_M = 3200.0
 
-/**
- * Build one fog feature per clear-radius in [radiiMeters]. Each feature = viewport
- * polygon minus the union of radius-r buffers around every traveled segment.
- * Caller stacks the features as translucent fill layers to produce a faded edge.
- *
- * Within a session, consecutive in-time, in-range fixes are joined into a LineString
- * so the painted stripe fills in between fixes — important at biking/driving speeds
- * where 5s-interval point circles barely overlap. Isolated fixes (or runs broken by
- * a dropout) become Points and buffer to circles, same as before.
- *
- * Uses a local equirectangular projection centered on the viewport so all JTS ops
- * happen in (approximate) metric Cartesian space. The smallest-radius union is
- * computed once, then iteratively buffered outward by the delta to each successive
- * radius — much cheaper than independent unions per ring.
- *
- * [bufferSegmentsPerQuadrant] controls how circular the disc edges look (number of
- * vertices per 90° arc). [simplifyToleranceM] is the Douglas-Peucker tolerance for
- * the final viewport-minus-union polygon. Both should scale with map zoom: low at
- * high zoom (sub-pixel detail), high at low zoom (cheap when discs are tiny).
- *
- * [points] must be ordered (sessionId asc, timestamp asc) as the DAO returns them.
- * [radiiMeters] must be non-empty and strictly ascending. Returns null if the
- * viewport is degenerate.
- */
-fun computeFogRings(
-    points: List<LocationPoint>,
-    bounds: LatLngBounds,
-    radiiMeters: List<Double>,
-    bufferSegmentsPerQuadrant: Int,
-    simplifyToleranceM: Double,
-): List<Feature?>? {
-    require(radiiMeters.isNotEmpty()) { "radiiMeters must not be empty" }
-    require(radiiMeters.zipWithNext().all { (a, b) -> a < b }) {
-        "radiiMeters must be strictly ascending"
-    }
-    require(bufferSegmentsPerQuadrant >= 1) { "bufferSegmentsPerQuadrant must be >= 1" }
-    require(simplifyToleranceM >= 0.0) { "simplifyToleranceM must be >= 0" }
+// Precision a fog tile's cleared union is baked at — fixed (zoom-independent) so a stored
+// tile serves every zoom level; the assembly step applies a zoom-scaled simplify on top.
+// 16 segments/quadrant = 64-sided discs (smooth for a translucent fill); 1m simplify keeps
+// stored WKB compact without visible shift at street zoom.
+const val FOG_TILE_SEGMENTS_PER_QUADRANT = 16
+const val FOG_TILE_SIMPLIFY_DEG = 1.0 / METERS_PER_DEG
 
-    val centerLat = (bounds.latitudeNorth + bounds.latitudeSouth) / 2.0
-    val centerLng = (bounds.longitudeEast + bounds.longitudeWest) / 2.0
+// ---- shared run tessellation -------------------------------------------------
+
+/** Split one session's time-ordered fixes into runs, breaking at large time/distance
+ *  gaps so a dropout or GPS glitch doesn't paint a stripe across the void. [xScale] is the
+ *  local E–W meters-per-degree used to measure jump distance. */
+private fun splitSessionIntoRuns(
+    sessionPoints: List<LocationPoint>,
+    xScale: Double,
+): List<List<LocationPoint>> {
+    val runs = ArrayList<List<LocationPoint>>()
+    var runStart = 0
+    while (runStart < sessionPoints.size) {
+        var runEnd = runStart + 1
+        while (runEnd < sessionPoints.size) {
+            val prev = sessionPoints[runEnd - 1]
+            val curr = sessionPoints[runEnd]
+            if (curr.timestamp - prev.timestamp > MAX_RUN_GAP_MS) break
+            val dx = (curr.lng - prev.lng) * xScale
+            val dy = (curr.lat - prev.lat) * METERS_PER_DEG
+            if (hypot(dx, dy) > MAX_RUN_SEGMENT_M) break
+            runEnd++
+        }
+        runs.add(sessionPoints.subList(runStart, runEnd))
+        runStart = runEnd
+    }
+    return runs
+}
+
+/** A run becomes a LineString (so the painted stripe fills between fixes) or, for an
+ *  isolated fix, a Point that buffers to a disc. */
+private fun runToGeometry(
+    run: List<LocationPoint>,
+    project: (Double, Double) -> Coordinate,
+    factory: GeometryFactory,
+): Geometry {
+    val coords = run.map { project(it.lat, it.lng) }
+    return if (coords.size == 1) factory.createPoint(coords[0])
+    else factory.createLineString(coords.toTypedArray())
+}
+
+// ---- per-chunk fog tile ------------------------------------------------------
+
+/**
+ * Cleared-area geometry for one fog tile: the union of [radiusMeters] buffers around the
+ * chunk's traveled runs, clipped to the chunk rectangle, returned in lat/lng (WGS84
+ * degrees). [points] must be the chunk's own fixes plus a halo of neighbor fixes whose
+ * discs / segments reach into the rect (the caller queries chunkBbox expanded by
+ * FOG_COVERAGE_RADIUS_M + MAX_RUN_SEGMENT_M). Clipping to the rect makes adjacent tiles
+ * abut without overlap, so they tile seamlessly at render.
+ *
+ * Buffering happens in a local equirectangular metric projection; the result is then
+ * unprojected to lat/lng so tiles computed under different chunk centers still combine
+ * correctly. Returns null when the chunk has no traveled geometry (fully fogged).
+ */
+fun computeChunkClearedUnion(
+    points: List<LocationPoint>,
+    chunkBounds: LatLngBounds,
+    radiusMeters: Double,
+    segmentsPerQuadrant: Int,
+    simplifyToleranceDeg: Double,
+): Geometry? {
+    if (points.isEmpty()) return null
+
+    val centerLat = (chunkBounds.latitudeNorth + chunkBounds.latitudeSouth) / 2.0
+    val centerLng = (chunkBounds.longitudeEast + chunkBounds.longitudeWest) / 2.0
     val cosCenterLat = cos(Math.toRadians(centerLat))
     if (cosCenterLat <= 0.0) return null
     val xScale = cosCenterLat * METERS_PER_DEG
 
-    fun project(lat: Double, lng: Double): Coordinate =
-        Coordinate((lng - centerLng) * xScale, (lat - centerLat) * METERS_PER_DEG)
-
-    fun unprojectToPoint(c: Coordinate): GjPoint = GjPoint.fromLngLat(
-        centerLng + c.x / xScale,
-        centerLat + c.y / METERS_PER_DEG,
-    )
-
     val factory = GeometryFactory()
-    val viewportRing = arrayOf(
-        project(bounds.latitudeSouth, bounds.longitudeWest),
-        project(bounds.latitudeSouth, bounds.longitudeEast),
-        project(bounds.latitudeNorth, bounds.longitudeEast),
-        project(bounds.latitudeNorth, bounds.longitudeWest),
-        project(bounds.latitudeSouth, bounds.longitudeWest),
-    )
-    val viewportPoly: Polygon = factory.createPolygon(viewportRing)
+    val project = { lat: Double, lng: Double ->
+        Coordinate((lng - centerLng) * xScale, (lat - centerLat) * METERS_PER_DEG)
+    }
 
-    val maxRadius = radiiMeters.last()
-    val latBuf = maxRadius / METERS_PER_DEG
-    val lngBuf = maxRadius / (max(cosCenterLat, 0.01) * METERS_PER_DEG)
-    val expSouth = bounds.latitudeSouth - latBuf
-    val expNorth = bounds.latitudeNorth + latBuf
-    val expWest = bounds.longitudeWest - lngBuf
-    val expEast = bounds.longitudeEast + lngBuf
-
-    val runGeometries = mutableListOf<Geometry>()
+    val runGeometries = ArrayList<Geometry>()
     for ((_, sessionPoints) in points.groupBy { it.sessionId }) {
-        var runStart = 0
-        while (runStart < sessionPoints.size) {
-            var runEnd = runStart + 1
-            while (runEnd < sessionPoints.size) {
-                val prev = sessionPoints[runEnd - 1]
-                val curr = sessionPoints[runEnd]
-                if (curr.timestamp - prev.timestamp > MAX_RUN_GAP_MS) break
-                val dx = (curr.lng - prev.lng) * xScale
-                val dy = (curr.lat - prev.lat) * METERS_PER_DEG
-                if (hypot(dx, dy) > MAX_RUN_SEGMENT_M) break
-                runEnd++
-            }
-            val run = sessionPoints.subList(runStart, runEnd)
-            // Bbox cull against expanded viewport — skip runs entirely off-screen.
-            // Using lat/lng bbox catches segments that pass through the viewport even
-            // when both endpoints are off-screen.
-            val minLat = run.minOf { it.lat }
-            val maxLat = run.maxOf { it.lat }
-            val minLng = run.minOf { it.lng }
-            val maxLng = run.maxOf { it.lng }
-            val onScreen = !(maxLat < expSouth || minLat > expNorth ||
-                maxLng < expWest || minLng > expEast)
-            if (onScreen) {
-                val coords = run.map { project(it.lat, it.lng) }
-                val geom: Geometry = if (coords.size == 1) {
-                    factory.createPoint(coords[0])
-                } else {
-                    factory.createLineString(coords.toTypedArray())
-                }
-                runGeometries.add(geom)
-            }
-            runStart = runEnd
+        for (run in splitSessionIntoRuns(sessionPoints, xScale)) {
+            runGeometries.add(runToGeometry(run, project, factory))
         }
     }
+    if (runGeometries.isEmpty()) return null
 
-    if (runGeometries.isEmpty()) {
-        val viewportFeature = jtsToGeoJsonFeature(viewportPoly, ::unprojectToPoint)
-        return radiiMeters.map { viewportFeature }
-    }
+    val buffered = runGeometries.map { it.buffer(radiusMeters, segmentsPerQuadrant) }
+    val union = UnaryUnionOp.union(buffered) ?: return null
+    if (union.isEmpty) return null
 
-    val coreBuffered = runGeometries.map {
-        it.buffer(radiiMeters[0], bufferSegmentsPerQuadrant)
-    }
-    var currentUnion: Geometry = UnaryUnionOp.union(coreBuffered)
-    val unions = mutableListOf(currentUnion)
-    var prevRadius = radiiMeters[0]
-    for (k in 1 until radiiMeters.size) {
-        val delta = radiiMeters[k] - prevRadius
-        currentUnion = currentUnion.buffer(delta, bufferSegmentsPerQuadrant)
-        unions.add(currentUnion)
-        prevRadius = radiiMeters[k]
-    }
+    // Unproject meters → lat/lng in place (the union is a throwaway temp).
+    union.apply(object : CoordinateFilter {
+        override fun filter(c: Coordinate) {
+            c.x = centerLng + c.x / xScale
+            c.y = centerLat + c.y / METERS_PER_DEG
+        }
+    })
+    union.geometryChanged()
 
-    return unions.map { union ->
-        val fog = viewportPoly.difference(union)
-        val simplified = DouglasPeuckerSimplifier.simplify(fog, simplifyToleranceM)
-        jtsToGeoJsonFeature(simplified, ::unprojectToPoint)
-    }
+    val clipped = union.intersection(latLngRect(chunkBounds, factory))
+    if (clipped.isEmpty) return null
+    val simplified =
+        if (simplifyToleranceDeg > 0) DouglasPeuckerSimplifier.simplify(clipped, simplifyToleranceDeg)
+        else clipped
+    return if (simplified.isEmpty) null else simplified
 }
+
+// Web Mercator can't represent the poles; ±85° is the standard world-fog cap.
+private const val FOG_WORLD_LAT_LIMIT = 85.0
+
+/**
+ * Assemble the fog fill as ONE world-spanning polygon with the visible tiles' cleared areas
+ * punched out as holes, simplified by [simplifyToleranceDeg] (scaled to the current zoom so
+ * low-zoom assemblies stay light). A single world-extent fill means there's no viewport-
+ * rectangle boundary to leave a seam, and the whole thing is one source updated atomically
+ * (no inner/outer hole-punch race / flash). Off-screen cleared areas simply aren't holes
+ * yet — they become holes once their tiles are in view. Returns null only if the result is
+ * empty (caller pushes an empty source).
+ */
+fun assembleWorldFog(
+    clearedTiles: List<Geometry>,
+    simplifyToleranceDeg: Double,
+): Feature? {
+    val factory = GeometryFactory()
+    val n = FOG_WORLD_LAT_LIMIT
+    val world = factory.createPolygon(
+        arrayOf(
+            Coordinate(-180.0, -n),
+            Coordinate(180.0, -n),
+            Coordinate(180.0, n),
+            Coordinate(-180.0, n),
+            Coordinate(-180.0, -n),
+        )
+    )
+    val cleared = if (clearedTiles.isEmpty()) null else UnaryUnionOp.union(clearedTiles)
+    val fog = if (cleared == null || cleared.isEmpty) world else world.difference(cleared)
+    if (fog.isEmpty) return null
+    val simplified =
+        if (simplifyToleranceDeg > 0) DouglasPeuckerSimplifier.simplify(fog, simplifyToleranceDeg)
+        else fog
+    if (simplified.isEmpty) return null
+    return jtsToGeoJsonFeature(simplified) { c -> GjPoint.fromLngLat(c.x, c.y) }
+}
+
+fun geometryToWkb(geom: Geometry): ByteArray = WKBWriter().write(geom)
+
+fun wkbToGeometry(bytes: ByteArray): Geometry = WKBReader().read(bytes)
+
+private fun latLngRect(bounds: LatLngBounds, factory: GeometryFactory): Polygon =
+    factory.createPolygon(
+        arrayOf(
+            Coordinate(bounds.longitudeWest, bounds.latitudeSouth),
+            Coordinate(bounds.longitudeEast, bounds.latitudeSouth),
+            Coordinate(bounds.longitudeEast, bounds.latitudeNorth),
+            Coordinate(bounds.longitudeWest, bounds.latitudeNorth),
+            Coordinate(bounds.longitudeWest, bounds.latitudeSouth),
+        )
+    )
 
 private fun jtsToGeoJsonFeature(
     geom: Geometry,

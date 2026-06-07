@@ -22,6 +22,7 @@ import com.anita.paintgo.data.Session
 import com.anita.paintgo.data.bandOf
 import com.anita.paintgo.data.cellXOf
 import com.anita.paintgo.data.cellYOf
+import com.anita.paintgo.data.markPointsDirty
 import com.google.android.gms.location.FusedLocationProviderClient
 import com.google.android.gms.location.LocationCallback
 import com.google.android.gms.location.LocationRequest
@@ -84,56 +85,89 @@ class LocationService : Service() {
 
     private val locationCallback = object : LocationCallback() {
         override fun onLocationResult(result: LocationResult) {
-            val sessionId = currentSessionId ?: return
-
             // Live dot: surface the latest fix at any accuracy so the visible marker
             // stays responsive when GPS is shaky. The accuracy halo grows to match,
             // so the user can read the uncertainty visually. Recording / fog writes
             // below still filter on MAX_ACCURACY_METERS, so noisy fixes don't
             // reveal fog or pollute the DB.
-            result.lastLocation?.let { loc ->
-                _liveLocation.value = LiveFix(
-                    lat = loc.latitude,
-                    lng = loc.longitude,
-                    accuracyMeters = loc.accuracy,
-                    bearing = if (loc.hasBearing()) loc.bearing else null,
-                )
-            }
-
-            val goodFixes = result.locations.filter { loc ->
-                val ok = loc.accuracy <= MAX_ACCURACY_METERS
-                if (!ok) Log.d("PaintGo", "Skipping low-accuracy fix: ${loc.accuracy}m")
-                ok
-            }
-            if (goodFixes.isEmpty()) return
-
-            val points = goodFixes.map { loc ->
-                val band = bandOf(loc.latitude)
-                LocationPoint(
-                    sessionId = sessionId,
-                    lat = loc.latitude,
-                    lng = loc.longitude,
-                    timestamp = loc.time,
-                    accuracy = loc.accuracy,
-                    band = band,
-                    cellX = cellXOf(loc.latitude),
-                    cellY = cellYOf(loc.longitude, band),
-                )
-            }
-            Log.d("PaintGo", "Inserting ${points.size} point(s) into session $sessionId")
-            scope.launch {
-                AppDatabase.get(applicationContext).locationPointDao().insertAll(points)
-            }
-
-            synchronized(adaptiveLock) {
-                for (loc in goodFixes) {
-                    recentFixes.addLast(loc)
-                    while (recentFixes.size > WINDOW_SIZE) recentFixes.removeFirst()
-                }
-                updateStationaryStateLocked()
-            }
-            evaluateInterval()
+            result.lastLocation?.let { updateLiveDot(it) }
+            ingestFixes(result.locations)
         }
+    }
+
+    /** Push a fix to the live UI marker, regardless of accuracy. */
+    private fun updateLiveDot(loc: Location) {
+        _liveLocation.value = LiveFix(
+            lat = loc.latitude,
+            lng = loc.longitude,
+            accuracyMeters = loc.accuracy,
+            bearing = if (loc.hasBearing()) loc.bearing else null,
+        )
+    }
+
+    /** Filter, persist, and paint the given fixes for the active session, then fold them
+     *  into the adaptive-polling window. Shared by the continuous stream and the manual
+     *  one-shot poll. No-op when not recording or when nothing clears the accuracy gate. */
+    private fun ingestFixes(locations: List<Location>) {
+        val sessionId = currentSessionId ?: return
+
+        val goodFixes = locations.filter { loc ->
+            val ok = loc.accuracy <= MAX_ACCURACY_METERS
+            if (!ok) Log.d("PaintGo", "Skipping low-accuracy fix: ${loc.accuracy}m")
+            ok
+        }
+        if (goodFixes.isEmpty()) return
+
+        val points = goodFixes.map { loc ->
+            val band = bandOf(loc.latitude)
+            LocationPoint(
+                sessionId = sessionId,
+                lat = loc.latitude,
+                lng = loc.longitude,
+                timestamp = loc.time,
+                accuracy = loc.accuracy,
+                band = band,
+                cellX = cellXOf(loc.latitude),
+                cellY = cellYOf(loc.longitude, band),
+            )
+        }
+        Log.d("PaintGo", "Inserting ${points.size} point(s) into session $sessionId")
+        scope.launch {
+            val db = AppDatabase.get(applicationContext)
+            db.locationPointDao().insertAll(points)
+            // Mark the touched chunks + session dirty so the next StatsEngine refresh
+            // recomputes only them. Dup-cell inserts that IGNORE still mark dirty —
+            // harmless, the recompute just re-derives the same count.
+            db.markPointsDirty(points)
+        }
+
+        synchronized(adaptiveLock) {
+            for (loc in goodFixes) {
+                recentFixes.addLast(loc)
+                while (recentFixes.size > WINDOW_SIZE) recentFixes.removeFirst()
+            }
+            updateStationaryStateLocked()
+        }
+        evaluateInterval()
+    }
+
+    /** One-shot high-accuracy fix on top of the running stream — fired when the user taps
+     *  the recenter pin while recording. Forces the GPS chip harder than the stream's
+     *  balanced-power request, so it can drop a sharper point on demand instead of waiting
+     *  for the next scheduled sample. Same accuracy gate as the stream, so a bad fix still
+     *  only moves the dot. */
+    @SuppressLint("MissingPermission")
+    private fun pollNow() {
+        if (currentSessionId == null) return
+        fusedClient.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, null)
+            .addOnSuccessListener { loc ->
+                Log.d("PaintGo", "Manual poll fix: $loc")
+                if (loc != null) {
+                    updateLiveDot(loc)
+                    ingestFixes(listOf(loc))
+                }
+            }
+            .addOnFailureListener { Log.w("PaintGo", "Manual poll failed", it) }
     }
 
     /** Caller must hold [adaptiveLock]. Marks the start of a stationary streak (or
@@ -208,6 +242,13 @@ class LocationService : Service() {
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 _running.value = false
                 stopSelf()
+            }
+            ACTION_POLL_NOW -> {
+                // On-demand high-accuracy fix. Only meaningful mid-recording; pollNow()
+                // no-ops when there's no active session, so a stray trigger can't start
+                // a non-foregrounded service doing background location work.
+                Log.d("PaintGo", "Manual poll requested")
+                pollNow()
             }
             else -> {
                 Log.d("PaintGo", "LocationService starting foreground")
@@ -324,6 +365,7 @@ class LocationService : Service() {
         private const val CHANNEL_ID = "paintgo_recording"
         private const val NOTIF_ID = 1
         private const val ACTION_STOP = "com.anita.paintgo.action.STOP"
+        private const val ACTION_POLL_NOW = "com.anita.paintgo.action.POLL_NOW"
         // 100m is liberal — emulator fixes are flat 100m, and city GPS can occasionally
         // land here. Revisit once we have real-device traces.
         private const val MAX_ACCURACY_METERS = 100f
@@ -349,6 +391,15 @@ class LocationService : Service() {
         fun stop(context: Context) {
             val intent = Intent(context, LocationService::class.java).apply {
                 action = ACTION_STOP
+            }
+            context.startService(intent)
+        }
+
+        /** Ask the running service for an immediate high-accuracy fix. No-op if the
+         *  service isn't recording (pollNow guards on the active session). */
+        fun pollNow(context: Context) {
+            val intent = Intent(context, LocationService::class.java).apply {
+                action = ACTION_POLL_NOW
             }
             context.startService(intent)
         }

@@ -24,7 +24,12 @@ import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -32,6 +37,8 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.LocationOn
@@ -40,6 +47,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -58,6 +66,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.app.ActivityCompat
@@ -72,14 +81,16 @@ import com.google.android.gms.location.Priority
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeoutOrNull
 import com.anita.paintgo.data.AppDatabase
-import com.anita.paintgo.data.FOG_COVERAGE_RADIUS_M
 import com.anita.paintgo.data.LocationPoint
 import com.anita.paintgo.data.POINT_GRID_STEP_LAT_DEG
 import com.anita.paintgo.data.forSelfInViewport
 import com.anita.paintgo.data.lngStepDeg
+import com.anita.paintgo.data.markPointsDirty
+import com.anita.paintgo.data.dirtyCountInViewport
+import com.anita.paintgo.fog.FogTiles
 import com.anita.paintgo.fog.MAX_RUN_GAP_MS
 import com.anita.paintgo.fog.MAX_RUN_SEGMENT_M
-import com.anita.paintgo.fog.computeFogRings
+import com.anita.paintgo.fog.assembleWorldFog
 import com.anita.paintgo.trail.TRAIL_COLOR_PROP
 import com.anita.paintgo.trail.TrailMode
 import com.anita.paintgo.trail.buildTrailFeatures
@@ -178,24 +189,18 @@ private data class FogSig(
     val latNorth: Double,
     val lngWest: Double,
     val lngEast: Double,
-    val pointCount: Int,
-    val segmentsPerQuadrant: Int,
-    val simplifyToleranceM: Double,
+    val simplifyToleranceDeg: Double,
 )
 
 // Web Mercator ground resolution at the equator at zoom 0. m/px at latitude lat,
 // zoom z = MERCATOR_M_PER_PX_AT_EQUATOR_Z0 * cos(lat) / 2^z.
 private const val MERCATOR_M_PER_PX_AT_EQUATOR_Z0 = 156_543.03392
-// Target on-screen length of a single buffer-arc segment, and the Douglas-Peucker
-// simplification tolerance, in pixels. ~2 px/segment makes 50m circles look round
-// at any zoom; ~0.5 px tolerance keeps the simplified outline from visibly shifting
-// between recomputes.
-private const val FOG_TARGET_ARC_PX = 2.0
+// Douglas-Peucker simplification tolerance for the assembled fog, in pixels. ~0.5 px
+// keeps the simplified outline from visibly shifting between recomputes. (Buffer-arc
+// precision now lives in the baked tiles — see FOG_TILE_SEGMENTS_PER_QUADRANT.)
 private const val FOG_TARGET_SIMPLIFY_PX = 0.5
-// Floors and ceilings on the adaptive precision — keep low-zoom work cheap and
-// high-zoom work bounded.
-private const val FOG_MIN_SEGMENTS_PER_QUADRANT = 4
-private const val FOG_MAX_SEGMENTS_PER_QUADRANT = 48
+// Floor and ceiling on the adaptive simplify tolerance (meters) — keep low-zoom work
+// cheap and high-zoom detail bounded.
 private const val FOG_MIN_SIMPLIFY_M = 0.1
 private const val FOG_MAX_SIMPLIFY_M = 4.0
 // Render fog over the visible viewport expanded by this fraction on each side, so
@@ -337,6 +342,9 @@ fun MapScreen(
     var centerOnUser by remember { mutableStateOf(centerOnUserInitially) }
     var viewportBounds by remember { mutableStateOf<LatLngBounds?>(null) }
     var lastFogSig by remember { mutableStateOf<FogSig?>(null) }
+    // True while the fog polygon is being recomputed (JTS work on a background thread) —
+    // drives the "Loading…" overlay. Heaviest when zoomed out over a large covered area.
+    var fogLoading by remember { mutableStateOf(false) }
     // Delete mode is hoisted to the parent so Settings can trigger it. The local-only
     // bits — the viewport-scoped point set and the tap selection — stay here since
     // nothing outside MapScreen needs to read them.
@@ -417,7 +425,7 @@ fun MapScreen(
                     // its viewport on top and the outer will get a hole punched out
                     // at the same moment (atomic update in the fog effect).
                     style.addSource(
-                        GeoJsonSource(FOG_OUTER_SOURCE_ID, buildOuterFogFeature(null))
+                        GeoJsonSource(FOG_OUTER_SOURCE_ID, buildOuterFogFeature())
                     )
                     style.addLayer(
                         FillLayer(FOG_OUTER_LAYER_ID, FOG_OUTER_SOURCE_ID).withProperties(
@@ -1013,25 +1021,23 @@ fun MapScreen(
         onDispose { map.removeOnMapClickListener(listener) }
     }
 
-    // Fog effect: re-runs when the points flow emits (a fix landed) OR the camera
-    // settles on new bounds. We query only the points whose 5m cell intersects the
-    // visible viewport expanded by FOG_COVERAGE_RADIUS_M + max-run-segment — anything
-    // farther out can't visibly draw inside the viewport. The signature dedup skips
-    // the JTS work when an insert lands off-screen, which is the common case while
-    // recording: a new fix near you doesn't change the fog in Brooklyn.
+    // Fog effect: re-runs when the points flow emits (a fix landed) OR the camera settles
+    // on new bounds. The heavy JTS work now lives in per-chunk cached tiles (FogTiles) —
+    // here we just assemble the cleared geometries of the visible tiles, recomputing only
+    // the dirty ones. The dirty-count + signature check skips the assembly entirely when
+    // nothing visible changed (e.g. a fix landed off-screen, or the camera didn't move).
     LaunchedEffect(pointTick, viewportBounds, styleReady, viewMode) {
         val bounds = viewportBounds ?: return@LaunchedEffect
         val map = mapRef ?: return@LaunchedEffect
         if (!styleReady) return@LaunchedEffect
-        // Skip JTS work entirely when the fog layer isn't being shown. The previously
-        // computed fog source data is kept, so flipping back to Fog mode shows the
-        // last-good polygon immediately; the next pointTick/viewport change recomputes.
+        // Skip work entirely when the fog layer isn't being shown. The previously computed
+        // fog source data is kept, so flipping back to Fog mode shows the last-good polygon
+        // immediately; the next pointTick/viewport change recomputes.
         if (viewMode != ViewMode.Fog) return@LaunchedEffect
 
-        // Expand visible bounds by FOG_VIEWPORT_MARGIN_FRAC on each side so the
-        // rendered fog polygon extends past the screen edge. Clamps lat to ±90;
-        // lng is left unclamped (LatLngBounds tolerates extreme zoom-out wraps
-        // and the JTS projection is local-equirectangular anyway).
+        // Expand visible bounds by FOG_VIEWPORT_MARGIN_FRAC on each side so the rendered
+        // fog polygon extends past the screen edge. Clamps lat to ±90; lng is left
+        // unclamped (LatLngBounds tolerates extreme zoom-out wraps).
         val visLatSpan = bounds.latitudeNorth - bounds.latitudeSouth
         val visLngSpan = bounds.longitudeEast - bounds.longitudeWest
         val marginLat = visLatSpan * FOG_VIEWPORT_MARGIN_FRAC
@@ -1044,61 +1050,59 @@ fun MapScreen(
             renderLatNorth, renderLngEast, renderLatSouth, renderLngWest,
         )
 
-        val bufferM = FOG_COVERAGE_RADIUS_M + MAX_RUN_SEGMENT_M
+        // Assembly simplify tolerance, scaled to zoom (degrees). Tiles are baked at a fixed
+        // precision; this keeps low-zoom assemblies of many tiles light.
         val centerLat = (renderLatNorth + renderLatSouth) / 2.0
         val cosCenterLat = cos(Math.toRadians(centerLat)).coerceAtLeast(0.01)
-        val latBufDeg = bufferM / 111_320.0
-        val lngBufDeg = bufferM / (111_320.0 * cosCenterLat)
-        val latSouth = renderLatSouth - latBufDeg
-        val latNorth = renderLatNorth + latBufDeg
-        val lngWest = renderLngWest - lngBufDeg
-        val lngEast = renderLngEast + lngBufDeg
-
-        val viewportPoints = AppDatabase.get(context).locationPointDao()
-            .forSelfInViewport(latSouth, latNorth, lngWest, lngEast)
-
-        // Pick polygon precision so the rendered fog edges stay sub-faceted at the
-        // current zoom. mPerPx is the on-screen scale at the viewport center; the
-        // segment count and simplify tolerance both target a constant pixel size, so
-        // the circle looks equally smooth whether you're at zoom 11 or 20.
         val zoom = map.cameraPosition.zoom
         val mPerPx = MERCATOR_M_PER_PX_AT_EQUATOR_Z0 * cosCenterLat / 2.0.pow(zoom)
-        val targetArcM = FOG_TARGET_ARC_PX * mPerPx
-        val segmentsPerQuadrant = (PI * FOG_COVERAGE_RADIUS_M / (4.0 * targetArcM))
-            .toInt()
-            .coerceIn(FOG_MIN_SEGMENTS_PER_QUADRANT, FOG_MAX_SEGMENTS_PER_QUADRANT)
-        val simplifyToleranceM = (FOG_TARGET_SIMPLIFY_PX * mPerPx)
-            .coerceIn(FOG_MIN_SIMPLIFY_M, FOG_MAX_SIMPLIFY_M)
+        val simplifyToleranceDeg = (FOG_TARGET_SIMPLIFY_PX * mPerPx)
+            .coerceIn(FOG_MIN_SIMPLIFY_M, FOG_MAX_SIMPLIFY_M) / 111_320.0
 
-        val sig = FogSig(
-            latSouth, latNorth, lngWest, lngEast, viewportPoints.size,
-            segmentsPerQuadrant, simplifyToleranceM,
+        val fogDao = AppDatabase.get(context).chunkFogDao()
+        val dirtyVisible = fogDao.dirtyCountInViewport(
+            renderLatSouth, renderLatNorth, renderLngWest, renderLngEast,
         )
-        if (sig == lastFogSig) return@LaunchedEffect
-        lastFogSig = sig
+        val sig = FogSig(
+            renderLatSouth, renderLatNorth, renderLngWest, renderLngEast, simplifyToleranceDeg,
+        )
+        // Nothing dirty in view and the camera hasn't moved since the last *completed*
+        // push → the rendered fog is already correct. (A fix near you dirties your visible
+        // tile, so live painting still lands.)
+        if (dirtyVisible == 0 && sig == lastFogSig) return@LaunchedEffect
 
-        val features = withContext(Dispatchers.Default) {
-            computeFogRings(
-                points = viewportPoints,
-                bounds = renderBounds,
-                radiiMeters = listOf(FOG_COVERAGE_RADIUS_M),
-                bufferSegmentsPerQuadrant = segmentsPerQuadrant,
-                simplifyToleranceM = simplifyToleranceM,
-            )
-        } ?: return@LaunchedEffect
-        val feature = features.firstOrNull() ?: return@LaunchedEffect
-        // Push both layers together so the outer fog gets its hole punched out
-        // at the same render frame the inner fog appears — no momentary
-        // double-opacity overlap.
-        val outerFeature = buildOuterFogFeature(renderBounds)
+        fogLoading = true
+        val feature = try {
+            withContext(Dispatchers.Default) {
+                val cleared = FogTiles.clearedTilesForViewport(context, renderBounds)
+                assembleWorldFog(cleared, simplifyToleranceDeg)
+            }
+        } finally {
+            fogLoading = false
+        }
+        // Fog is now a single world-spanning polygon with cleared holes, pushed to the one
+        // inner source. The old outer hole-punch layer is retired (kept empty) — this kills
+        // the viewport-rectangle seam and the white flash that came from the inner/outer
+        // split. Update inner first so there's never a frame with no fog at all.
         map.style?.let { style ->
-            style.getSourceAs<GeoJsonSource>(FOG_OUTER_SOURCE_ID)?.setGeoJson(outerFeature)
-            style.getSourceAs<GeoJsonSource>(FOG_SOURCE_ID)?.setGeoJson(feature)
+            val empty = FeatureCollection.fromFeatures(emptyArray())
+            val innerSource = style.getSourceAs<GeoJsonSource>(FOG_SOURCE_ID)
+            if (feature != null) innerSource?.setGeoJson(feature) else innerSource?.setGeoJson(empty)
+            style.getSourceAs<GeoJsonSource>(FOG_OUTER_SOURCE_ID)?.setGeoJson(empty)
+            // Record the signature only after a completed push — a run cancelled mid-
+            // assembly (e.g. by a GPS fix while recording) must not mark this viewport
+            // "done" and block the next run from finishing it.
+            lastFogSig = sig
         }
     }
 
     Box(modifier = modifier) {
         AndroidView(factory = { mapView }, modifier = Modifier.fillMaxSize())
+        if (fogLoading) {
+            FogLoadingDot(
+                modifier = Modifier.align(Alignment.TopEnd).padding(16.dp),
+            )
+        }
         when {
             !hasPermission -> {
                 PermissionPrompt(
@@ -1136,7 +1140,13 @@ fun MapScreen(
                         FloatingActionButton(
                             onClick = {
                                 centerOnUser = true
-                                if (!isRecording) fetchTrigger++
+                                // While recording, ask the service for an immediate
+                                // high-accuracy fix — it persists + paints through the
+                                // same path as the stream, and updates the live dot the
+                                // camera recenters on. Idle, there's no service, so do a
+                                // local one-shot just to refresh the dot (no paint).
+                                if (isRecording) LocationService.pollNow(context)
+                                else fetchTrigger++
                             }
                         ) {
                             Icon(Icons.Filled.LocationOn, contentDescription = "Recenter on my location")
@@ -1165,7 +1175,12 @@ fun MapScreen(
                         onDeleteModeChange(false)
                         selectedDeleteIds = emptySet()
                         scope.launch(Dispatchers.IO) {
-                            AppDatabase.get(context).locationPointDao().deleteByIds(ids)
+                            val db = AppDatabase.get(context)
+                            // Fetch before deleting so we know which chunks/sessions to
+                            // recompute, then mark them dirty for the next stats refresh.
+                            val removed = db.locationPointDao().byIds(ids)
+                            db.locationPointDao().deleteByIds(ids)
+                            db.markPointsDirty(removed)
                         }
                     }) { Text("Delete") }
                 },
@@ -1175,6 +1190,28 @@ fun MapScreen(
             )
         }
     }
+}
+
+/** Unobtrusive fog-recompute indicator: a small yellow dot in the corner that slowly
+ *  pulses its opacity. Replaces the old "Loading…" banner, which fired too often to sit
+ *  centered over the map. */
+@Composable
+private fun FogLoadingDot(modifier: Modifier = Modifier) {
+    val transition = rememberInfiniteTransition(label = "fogLoadingPulse")
+    val alpha by transition.animateFloat(
+        initialValue = 0.5f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1100),
+            repeatMode = RepeatMode.Reverse,
+        ),
+        label = "fogLoadingAlpha",
+    )
+    Box(
+        modifier = modifier
+            .size(10.dp)
+            .background(Color(0xFFFFD600).copy(alpha = alpha), CircleShape)
+    )
 }
 
 @Composable
@@ -1435,7 +1472,10 @@ private fun buildDebugGridFeatures(
 // the source before the first camera-idle fog computation runs. Ring winding
 // follows the GeoJSON right-hand rule (exterior CCW, holes CW) so MapLibre
 // fills the area between them.
-private fun buildOuterFogFeature(hole: LatLngBounds?): Feature {
+// Full-world fog, used only to seed the fog before the first real assembly so the world
+// looks fogged on the first frame. The hole-punch outer layer it used to drive is retired;
+// the live fog is now a single world-spanning polygon with cleared holes (assembleWorldFog).
+private fun buildOuterFogFeature(): Feature {
     val n = FOG_WORLD_LAT_LIMIT
     val outer = listOf(
         Point.fromLngLat(-180.0, -n),
@@ -1444,26 +1484,7 @@ private fun buildOuterFogFeature(hole: LatLngBounds?): Feature {
         Point.fromLngLat(-180.0, n),
         Point.fromLngLat(-180.0, -n),
     )
-    val rings = if (hole == null) {
-        listOf(outer)
-    } else {
-        // Clamp the hole's lng to ±180 in case extreme zoom-out + 20% margin
-        // pushed renderBounds past the antimeridian. Outside that range MapLibre's
-        // tile boundaries would do unpredictable things with the hole anyway.
-        val w = hole.longitudeWest.coerceIn(-180.0, 180.0)
-        val e = hole.longitudeEast.coerceIn(-180.0, 180.0)
-        val s = hole.latitudeSouth.coerceIn(-n, n)
-        val nLat = hole.latitudeNorth.coerceIn(-n, n)
-        val inner = listOf(
-            Point.fromLngLat(w, s),
-            Point.fromLngLat(w, nLat),
-            Point.fromLngLat(e, nLat),
-            Point.fromLngLat(e, s),
-            Point.fromLngLat(w, s),
-        )
-        listOf(outer, inner)
-    }
-    return Feature.fromGeometry(GjPolygon.fromLngLats(rings))
+    return Feature.fromGeometry(GjPolygon.fromLngLats(listOf(outer)))
 }
 
 // Polygon approximation of a circle of [radiusMeters] around (lat, lng). Equirectangular

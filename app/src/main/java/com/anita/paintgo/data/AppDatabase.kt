@@ -8,29 +8,52 @@ import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 
 @Database(
-    entities = [Owner::class, Session::class, LocationPoint::class],
-    version = 4,
+    entities = [
+        Owner::class,
+        Session::class,
+        LocationPoint::class,
+        ChunkCoverage::class,
+        ChunkRegionCoverage::class,
+        ChunkFog::class,
+        SessionStat::class,
+    ],
+    version = 6,
     exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {
     abstract fun ownerDao(): OwnerDao
     abstract fun sessionDao(): SessionDao
     abstract fun locationPointDao(): LocationPointDao
+    abstract fun chunkCoverageDao(): ChunkCoverageDao
+    abstract fun chunkRegionCoverageDao(): ChunkRegionCoverageDao
+    abstract fun chunkFogDao(): ChunkFogDao
+    abstract fun sessionStatDao(): SessionStatDao
 
     companion object {
         @Volatile private var instance: AppDatabase? = null
+
+        const val DB_NAME = "paintgo.db"
 
         fun get(context: Context): AppDatabase = instance ?: synchronized(this) {
             instance ?: Room.databaseBuilder(
                 context.applicationContext,
                 AppDatabase::class.java,
-                "paintgo.db",
+                DB_NAME,
             )
                 .addCallback(SeedCallback)
-                .addMigrations(MIGRATION_2_3, MIGRATION_3_4)
+                .addMigrations(MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6)
                 .fallbackToDestructiveMigration(dropAllTables = true)
                 .build()
                 .also { instance = it }
+        }
+
+        // Close the open database and drop the cached instance so the next get() reopens
+        // it from disk. Used by backup restore, which swaps the underlying .db file out
+        // from under Room: any open handle must be released first, and the next get() must
+        // build a fresh instance bound to the restored file.
+        fun closeAndReset() = synchronized(this) {
+            instance?.close()
+            instance = null
         }
 
         // v2 → v3: introduces banded grid (lat-band-aware cellY). LocationPoint gets a
@@ -148,6 +171,87 @@ abstract class AppDatabase : RoomDatabase() {
                 db.execSQL(
                     "CREATE UNIQUE INDEX IF NOT EXISTS index_LocationPoint_sessionId_band_cellX_cellY " +
                         "ON LocationPoint(sessionId, band, cellX, cellY)"
+                )
+            }
+        }
+
+        // v4 → v5: adds the spatial chunk stats cache. FULLY ADDITIVE — three new tables
+        // plus one CREATE INDEX on LocationPoint. No table rewrite, no LocationPoint
+        // column change, so existing points are untouched (zero walk loss). The cache
+        // tables start empty; StatsEngine backfills them once from existing points on the
+        // next stats refresh. CREATE statements mirror Room's generated schema for the
+        // ChunkCoverage / ChunkRegionCoverage / SessionStat entities so the post-migration
+        // schema validates.
+        private val MIGRATION_4_5 = object : Migration(4, 5) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `ChunkCoverage` (
+                        `band` INTEGER NOT NULL,
+                        `chunkX` INTEGER NOT NULL,
+                        `chunkY` INTEGER NOT NULL,
+                        `coveredCellCount` INTEGER NOT NULL,
+                        `dirty` INTEGER NOT NULL,
+                        PRIMARY KEY(`band`, `chunkX`, `chunkY`)
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `ChunkRegionCoverage` (
+                        `band` INTEGER NOT NULL,
+                        `chunkX` INTEGER NOT NULL,
+                        `chunkY` INTEGER NOT NULL,
+                        `regionKey` TEXT NOT NULL,
+                        `cellCount` INTEGER NOT NULL,
+                        PRIMARY KEY(`band`, `chunkX`, `chunkY`, `regionKey`)
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `SessionStat` (
+                        `sessionId` INTEGER NOT NULL,
+                        `distanceKm` REAL NOT NULL,
+                        `dirty` INTEGER NOT NULL,
+                        PRIMARY KEY(`sessionId`),
+                        FOREIGN KEY(`sessionId`) REFERENCES `Session`(`id`)
+                            ON UPDATE NO ACTION ON DELETE CASCADE
+                    )
+                    """.trimIndent()
+                )
+                // Deferred perf index (old TODO.md:49) — non-destructive after all.
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_LocationPoint_band_cellX_cellY` " +
+                        "ON `LocationPoint` (`band`, `cellX`, `cellY`)"
+                )
+            }
+        }
+
+        // v5 → v6: adds the per-chunk fog tile cache (ChunkFog). ADDITIVE — one new table,
+        // no change to existing data. Seeds a dirty row for every chunk already known to
+        // the stats cache so those tiles get recomputed (lazily, when first viewed) rather
+        // than rendering as bare basemap; chunks with no points have no ChunkCoverage row
+        // and stay fully fogged with no ChunkFog row needed.
+        private val MIGRATION_5_6 = object : Migration(5, 6) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `ChunkFog` (
+                        `band` INTEGER NOT NULL,
+                        `chunkX` INTEGER NOT NULL,
+                        `chunkY` INTEGER NOT NULL,
+                        `clearedWkb` BLOB,
+                        `dirty` INTEGER NOT NULL,
+                        PRIMARY KEY(`band`, `chunkX`, `chunkY`)
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    """
+                    INSERT INTO ChunkFog (band, chunkX, chunkY, clearedWkb, dirty)
+                    SELECT band, chunkX, chunkY, NULL, 1 FROM ChunkCoverage
+                    """.trimIndent()
                 )
             }
         }

@@ -106,10 +106,10 @@ other misc todos written by anita
   - dynamically pull borders from osm?
 - can we calculate speed / find whether biking / walking / train?
 - train integration... if detected on a train, special handle the train stops and tracks to show perfectly 
-- add exporting 
 - make prettier
-- chunking?
 
 - store stats (not just which ones to show, but also stats values for faraway places)
 - snap to street? 
 - interpolate points??
+
+- loading indicator
